@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 
 # ==================================================
-# UFW / Fail2Ban 中文轻量管理脚本
+# UFW / Fail2Ban 中文轻量管理脚本 增强版
 # 支持：
 # - 安装 UFW 防火墙
 # - 安装 Fail2Ban 防爆破
 # - 自动封禁扫描器
 # - 日志只保留 7 天
+# - 一键自检 + 风险检测 + 安全评分
+# - 彻底卸载本脚本
 # - ufw -f 快捷进入管理菜单
 #
 # 适合 Debian / Ubuntu 小型 VPS
@@ -17,6 +19,7 @@ set -u
 REAL_UFW="/usr/sbin/ufw"
 SELF_MENU="/usr/local/sbin/ufw-f-menu"
 WRAPPER_UFW="/usr/local/sbin/ufw"
+LOGROTATE_FILE="/etc/logrotate.d/ufw-fail2ban-lite"
 
 need_root() {
     if [ "$(id -u)" -ne 0 ]; then
@@ -62,7 +65,7 @@ install_log_limit() {
 
     mkdir -p /etc/logrotate.d
 
-    cat >/etc/logrotate.d/ufw-fail2ban-lite <<'EOF'
+    cat >"$LOGROTATE_FILE" <<'EOF'
 # ==================================================
 # UFW / Fail2Ban 日志限制配置
 # 说明：
@@ -334,6 +337,175 @@ install_all_security() {
     pause
 }
 
+security_self_check() {
+    need_root
+
+    score=100
+    warn_count=0
+    danger_count=0
+
+    ok() { echo "✅ $1"; }
+    warn() { echo "⚠️  $1"; score=$((score-8)); warn_count=$((warn_count+1)); }
+    danger() { echo "❌ $1"; score=$((score-15)); danger_count=$((danger_count+1)); }
+
+    clear
+    echo "========== 一键自检 + 风险检测 + 当前安全评分 =========="
+    echo
+
+    echo "【1】UFW 防火墙状态"
+    if command -v ufw >/dev/null 2>&1; then
+        if ufw status | grep -qi "Status: active"; then
+            ok "UFW 已启用"
+        else
+            danger "UFW 未启用，本机防火墙可能没有生效"
+        fi
+
+        ufw_status_verbose="$(ufw status verbose 2>/dev/null || true)"
+        echo "$ufw_status_verbose" | grep -qi "Default: deny (incoming)" \
+            && ok "默认入站策略为 deny，未放行端口会被拦截" \
+            || danger "默认入站策略不是 deny，可能存在全部放行风险"
+
+        echo "$ufw_status_verbose" | grep -qi "allow (outgoing)" \
+            && ok "默认出站策略为 allow，正常访问外网不受影响" \
+            || warn "默认出站策略不是 allow，请确认是否符合你的需求"
+
+        ufw status numbered
+    else
+        danger "未安装 UFW"
+    fi
+
+    echo
+    echo "【2】底层防火墙规则检测"
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -S | grep -q "ufw" \
+            && ok "检测到底层 iptables 中存在 UFW 规则" \
+            || warn "iptables 中没有明显 UFW 规则，可能 UFW 未正确写入规则"
+    else
+        warn "未找到 iptables 命令，无法检查底层规则"
+    fi
+
+    if command -v nft >/dev/null 2>&1; then
+        nft list ruleset 2>/dev/null | grep -qi "ufw" \
+            && ok "检测到 nftables 中存在 UFW 规则" \
+            || warn "nftables 中没有明显 UFW 规则，这在部分系统不一定是问题"
+    fi
+
+    echo
+    echo "【3】SSH 连接安全"
+    ssh_port_guess="$(sshd -T 2>/dev/null | awk '/^port / {print $2; exit}')"
+    ssh_port_guess="${ssh_port_guess:-22}"
+
+    if command -v ufw >/dev/null 2>&1; then
+        ufw status | grep -Eq "${ssh_port_guess}(/tcp)?[[:space:]]+ALLOW" \
+            && ok "SSH 端口 ${ssh_port_guess} 已在 UFW 中放行" \
+            || warn "没有明显看到 SSH 端口 ${ssh_port_guess} 放行规则，请确认避免断连"
+
+        ufw status | grep -Eq "22(/tcp)?[[:space:]]+ALLOW" \
+            && warn "检测到 22 端口放行，如果你没有改 SSH 端口，容易被扫描爆破" \
+            || ok "未看到 22 端口明显放行，若你使用自定义 SSH 端口，这是好事"
+    fi
+
+    echo
+    echo "【4】Fail2Ban 防爆破状态"
+    if command -v fail2ban-client >/dev/null 2>&1; then
+        if systemctl is-active --quiet fail2ban; then
+            ok "Fail2Ban 服务正在运行"
+        else
+            danger "Fail2Ban 服务未运行"
+        fi
+
+        jail_list="$(fail2ban-client status 2>/dev/null | awk -F: '/Jail list/ {print $2}' | xargs || true)"
+        if [ -n "$jail_list" ]; then
+            ok "当前启用的防护：$jail_list"
+        else
+            warn "未检测到启用中的 Fail2Ban Jail"
+        fi
+
+        fail2ban-client status sshd >/dev/null 2>&1 \
+            && ok "sshd 防爆破已启用" \
+            || warn "sshd 防爆破未启用或读取失败"
+
+        fail2ban-client status ufw-scanner >/dev/null 2>&1 \
+            && ok "自动封禁扫描器 ufw-scanner 已启用" \
+            || warn "未启用自动封禁扫描器 ufw-scanner"
+    else
+        warn "未安装 Fail2Ban"
+    fi
+
+    echo
+    echo "【5】日志保留与磁盘风险"
+    if [ -f "$LOGROTATE_FILE" ]; then
+        grep -q "rotate 7" "$LOGROTATE_FILE" \
+            && ok "日志轮转已配置为保留 7 天" \
+            || warn "日志轮转存在，但不是保留 7 天"
+    else
+        warn "未找到日志保留 7 天配置"
+    fi
+
+    df -h /
+    root_use="$(df / | awk 'NR==2 {gsub("%","",$5); print $5}')"
+    if [ "${root_use:-0}" -ge 90 ]; then
+        danger "根分区磁盘使用率超过 90%，日志或服务可能出问题"
+    elif [ "${root_use:-0}" -ge 75 ]; then
+        warn "根分区磁盘使用率超过 75%，建议清理"
+    else
+        ok "根分区空间看起来正常"
+    fi
+
+    echo
+    echo "【6】常见绕过本机防火墙风险"
+    if command -v docker >/dev/null 2>&1; then
+        if systemctl is-active --quiet docker; then
+            warn "检测到 Docker 正在运行。Docker 发布端口可能绕过 UFW，需要单独检查 Docker 防火墙规则"
+        else
+            ok "检测到 Docker 但未运行"
+        fi
+    else
+        ok "未检测到 Docker"
+    fi
+
+    if ss -tulpen >/dev/null 2>&1; then
+        echo
+        echo "当前监听端口："
+        ss -tulpen | awk 'NR==1 || /LISTEN|UNCONN/'
+    else
+        warn "无法使用 ss 查看监听端口"
+    fi
+
+    echo
+    echo "【7】云服务商安全组提醒"
+    echo "说明：云服务商安全组是外层防火墙，UFW 是服务器本机防火墙。"
+    echo "如果云控制台全部放行，本机 UFW 仍然应该能拦截。"
+    echo "如果你禁用了某端口但仍能访问，常见原因："
+    echo "1. UFW 实际没有 active"
+    echo "2. 默认入站不是 deny"
+    echo "3. 服务通过 Docker 发布端口绕过 UFW"
+    echo "4. 访问的是 IPv6，但你只限制了 IPv4"
+    echo "5. 规则顺序或 allow 规则仍存在"
+    echo "6. 服务在内网访问，不经过你以为的公网入口"
+    echo "7. 云厂商控制台放行不是问题本身，它只是不会帮你挡流量"
+
+    echo
+    if [ "$score" -lt 0 ]; then score=0; fi
+    echo "========== 当前安全评分 =========="
+    echo "安全分：${score}/100"
+    echo "高风险项：${danger_count}"
+    echo "提醒项：${warn_count}"
+    echo
+
+    if [ "$score" -ge 85 ]; then
+        echo "评级：优秀"
+    elif [ "$score" -ge 70 ]; then
+        echo "评级：良好"
+    elif [ "$score" -ge 50 ]; then
+        echo "评级：一般，需要检查"
+    else
+        echo "评级：较危险，建议立即处理"
+    fi
+
+    pause
+}
+
 show_fail2ban_running_protection() {
     echo "========== 当前正在运行的 Fail2Ban 防护 =========="
     fail2ban-client status
@@ -421,6 +593,7 @@ ufw_menu() {
         echo "11. 重置 UFW 防火墙"
         echo "12. 开启 UFW 日志"
         echo "13. 关闭 UFW 日志"
+        echo "14. 一键自检 + 风险检测 + 安全评分"
         echo "0. 返回主菜单"
         echo
 
@@ -456,6 +629,7 @@ ufw_menu() {
                 ;;
             12) ufw logging on ;;
             13) ufw logging off ;;
+            14) security_self_check; return ;;
             0) return ;;
             *) echo "无效选择。" ;;
         esac
@@ -486,6 +660,7 @@ fail2ban_menu() {
         echo "16. 查看基础配置文件"
         echo "17. 查看扫描器配置文件"
         echo "18. 安装/刷新日志保留 7 天配置"
+        echo "19. 一键自检 + 风险检测 + 安全评分"
         echo "0. 返回主菜单"
         echo
 
@@ -532,6 +707,7 @@ fail2ban_menu() {
                 cat /etc/fail2ban/filter.d/ufw-scanner.conf 2>/dev/null || true
                 ;;
             18) install_log_limit ;;
+            19) security_self_check; return ;;
             0) return ;;
             *) echo "无效选择。" ;;
         esac
@@ -571,6 +747,50 @@ uninstall_fail2ban() {
     pause
 }
 
+uninstall_this_script_only() {
+    need_root
+
+    echo "此功能只清理本管理脚本，不卸载 UFW / Fail2Ban。"
+    echo "会删除："
+    echo "$SELF_MENU"
+    echo "$WRAPPER_UFW"
+    echo "$LOGROTATE_FILE"
+    echo
+    read -rp "确认彻底卸载本脚本？输入 YES：" yes
+    [ "$yes" != "YES" ] && return
+
+    rm -f "$SELF_MENU"
+    rm -f "$WRAPPER_UFW"
+    rm -f "$LOGROTATE_FILE"
+
+    echo "本脚本快捷入口和日志轮转配置已清理。"
+    echo "UFW / Fail2Ban 本体未卸载。"
+    echo "如果你是通过当前目录 ./ufw-f.sh 运行的，也可以手动删除：rm -f ./ufw-f.sh"
+    pause
+}
+
+full_cleanup_all() {
+    need_root
+
+    echo "危险操作：这会卸载 UFW、Fail2Ban，并删除本脚本相关配置。"
+    read -rp "确认全部清理？输入 YES：" yes
+    [ "$yes" != "YES" ] && return
+
+    systemctl stop fail2ban >/dev/null 2>&1 || true
+    systemctl disable fail2ban >/dev/null 2>&1 || true
+    ufw --force disable >/dev/null 2>&1 || true
+
+    apt purge -y fail2ban ufw
+    apt autoremove -y
+
+    rm -rf /etc/fail2ban /etc/ufw
+    rm -f /var/log/fail2ban.log
+    rm -f "$SELF_MENU" "$WRAPPER_UFW" "$LOGROTATE_FILE"
+
+    echo "已尽量完成全部清理。"
+    pause
+}
+
 main_menu() {
     need_root
     check_tools
@@ -592,6 +812,9 @@ main_menu() {
         echo "6. 卸载 Fail2Ban 并清理"
         echo "7. 一键安装 UFW + Fail2Ban + 扫描器防护"
         echo "8. 安装/刷新日志保留 7 天配置"
+        echo "9. 一键自检 + 风险检测 + 当前安全评分"
+        echo "10. 仅卸载本管理脚本"
+        echo "11. 全部清理：卸载 UFW + Fail2Ban + 本脚本"
         echo "0. 退出"
         echo
 
@@ -606,6 +829,9 @@ main_menu() {
             6) uninstall_fail2ban ;;
             7) install_all_security ;;
             8) install_log_limit; pause ;;
+            9) security_self_check ;;
+            10) uninstall_this_script_only ;;
+            11) full_cleanup_all ;;
             0) exit 0 ;;
             *) echo "无效选择。"; pause ;;
         esac
