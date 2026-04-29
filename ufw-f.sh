@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 
 # ==================================================
-# UFW / Fail2Ban 中文轻量管理脚本 精简优化版
+# UFW / Fail2Ban 中文轻量管理脚本 精简优化版 v3
 # 适合 Debian / Ubuntu VPS
 #
 # 功能：
 # - UFW 防火墙安装/管理
 # - Fail2Ban 防爆破安装/管理
 # - 自动封禁扫描器
-# - 日志保留 7 天
+# - 默认日志保留 7 天
+# - 主动清理日志
 # - 一键自检 + 风险检测 + 安全评分
-# - 日志分析，不直接刷屏
-# - 彻底卸载本脚本
+# - 所有检测尽量输出中文摘要，不刷原始长日志
 #
 # 快捷入口：
 # sudo ufw -f
@@ -90,7 +90,35 @@ install_log_limit() {
 }
 EOF
 
-    echo "日志限制已设置：只保留 7 天。"
+    echo "日志限制已设置：每天轮转，只保留 7 天。"
+}
+
+clean_security_logs() {
+    need_root
+
+    echo "========== 主动清理日志 =========="
+    echo "此功能会清空当前 UFW / Fail2Ban 日志内容。"
+    echo "不会卸载服务，不会删除配置。"
+    echo
+    read -rp "确认清理？输入 YES：" yes
+    [ "$yes" != "YES" ] && return
+
+    for f in /var/log/fail2ban.log /var/log/ufw.log; do
+        if [ -f "$f" ]; then
+            : > "$f"
+            echo "已清空：$f"
+        else
+            echo "未找到：$f"
+        fi
+    done
+
+    journalctl --rotate >/dev/null 2>&1 || true
+    journalctl --vacuum-time=7d >/dev/null 2>&1 || true
+
+    systemctl reload fail2ban >/dev/null 2>&1 || true
+    systemctl reload rsyslog >/dev/null 2>&1 || true
+
+    echo "systemd 日志已尝试只保留最近 7 天。"
 }
 
 ensure_log_files() {
@@ -110,29 +138,25 @@ analyze_fail2ban_error() {
 
     if echo "$err" | grep -qi "Have not found any log file"; then
         echo "问题：某个防护找不到日志文件。"
-        echo "常见原因：扫描器读取 /var/log/ufw.log，但系统还没生成这个日志。"
-        found=1
-    fi
-
-    if echo "$err" | grep -qi "No file"; then
-        echo "问题：存在缺失文件。"
+        echo "建议：脚本会自动创建日志文件；如果仍失败，可先禁用扫描器，只保留 SSH 防护。"
         found=1
     fi
 
     if echo "$err" | grep -qi "No failure-id group"; then
-        echo "问题：某个过滤规则 failregex 不兼容。"
+        echo "问题：某个过滤规则不兼容当前日志格式。"
+        echo "建议：禁用扫描器，保留 sshd 防爆破。"
         found=1
     fi
 
     if echo "$err" | grep -qi "ERROR"; then
         echo
         echo "错误摘要："
-        echo "$err" | grep -i "ERROR" | tail -n 8
+        echo "$err" | grep -i "ERROR" | tail -n 5
         found=1
     fi
 
     if [ "$found" = 0 ]; then
-        echo "没有识别到明确原因，建议查看 systemctl status fail2ban。"
+        echo "没有识别到明确原因。"
     fi
 }
 
@@ -342,7 +366,7 @@ bantime = 6h
 # 使用 UFW 封禁
 banaction = ufw
 
-# 使用文件轮询读取日志，兼容性更好
+# 文件轮询读取日志，兼容性更好
 backend = polling
 EOF
 
@@ -358,6 +382,7 @@ EOF
 }
 
 install_all_security() {
+    install_log_limit
     install_ufw
     install_fail2ban
     install_scanner_jail
@@ -368,25 +393,32 @@ analyze_ufw_logs() {
     echo "========== UFW 拦截分析 =========="
 
     if [ ! -s /var/log/ufw.log ]; then
-        echo "暂无 UFW 日志。"
-        echo "可能原因：还没有被拦截记录，或 rsyslog 未写入 /var/log/ufw.log。"
+        echo "暂无 UFW 拦截日志。"
+        echo "说明：没有日志不一定是异常，可能只是还没有外部访问被拦截。"
         return
     fi
 
     total="$(grep -c "UFW BLOCK" /var/log/ufw.log 2>/dev/null || echo 0)"
     echo "拦截记录数量：$total"
 
+    if [ "$total" = "0" ]; then
+        echo "分析：暂未发现 UFW BLOCK 拦截记录。"
+        return
+    fi
+
     echo
     echo "高频来源 IP："
     grep "UFW BLOCK" /var/log/ufw.log 2>/dev/null \
         | sed -n 's/.*SRC=\([^ ]*\).*/\1/p' \
-        | sort | uniq -c | sort -nr | head -n 8
+        | sort | uniq -c | sort -nr | head -n 8 \
+        | awk '{print "来源 " $2 "，触发 " $1 " 次"}'
 
     echo
     echo "高频目标端口："
     grep "UFW BLOCK" /var/log/ufw.log 2>/dev/null \
         | sed -n 's/.*DPT=\([^ ]*\).*/\1/p' \
-        | sort | uniq -c | sort -nr | head -n 8
+        | sort | uniq -c | sort -nr | head -n 8 \
+        | awk '{print "端口 " $2 "，被探测 " $1 " 次"}'
 }
 
 analyze_fail2ban_logs() {
@@ -401,19 +433,94 @@ analyze_fail2ban_logs() {
         echo "解封次数：$unbans"
         echo "错误数量：$errors"
 
+        if [ "$errors" != "0" ]; then
+            echo "分析：日志中出现错误，建议进入 Fail2Ban 管理执行“测试/重启”。"
+        fi
+
         echo
-        echo "最近封禁 IP："
+        echo "最近高频封禁 IP："
         grep " Ban " /var/log/fail2ban.log 2>/dev/null \
-            | tail -n 20 \
+            | tail -n 100 \
             | sed -n 's/.*Ban \([^ ]*\).*/\1/p' \
-            | sort | uniq -c | sort -nr | head -n 8
+            | sort | uniq -c | sort -nr | head -n 8 \
+            | awk '{print "IP " $2 "，最近封禁 " $1 " 次"}'
     else
-        echo "暂无 /var/log/fail2ban.log 内容。"
-        echo "尝试从 systemd 日志提取摘要："
-        journalctl -u fail2ban -n 200 --no-pager 2>/dev/null \
-            | grep -Ei "Ban|Unban|ERROR" \
-            | tail -n 15
+        echo "暂无 Fail2Ban 日志内容。"
+        echo "说明：可能还没有封禁记录，或服务未运行。"
     fi
+}
+
+show_port_summary() {
+    echo "========== 监听端口中文摘要 =========="
+
+    if ! command -v ss >/dev/null 2>&1; then
+        echo "未找到 ss 命令，无法分析监听端口。"
+        return
+    fi
+
+    tmp="$(mktemp)"
+    ss -tulnH 2>/dev/null > "$tmp"
+
+    if [ ! -s "$tmp" ]; then
+        echo "未检测到监听端口。"
+        rm -f "$tmp"
+        return
+    fi
+
+    total="$(wc -l < "$tmp" | xargs)"
+    tcp_count="$(awk '$1=="tcp"{c++} END{print c+0}' "$tmp")"
+    udp_count="$(awk '$1=="udp"{c++} END{print c+0}' "$tmp")"
+
+    echo "监听总数：${total}"
+    echo "TCP 监听：${tcp_count}"
+    echo "UDP 监听：${udp_count}"
+    echo
+
+    echo "常见端口识别："
+
+    has_common=0
+    while read -r proto state recv send local peer rest; do
+        port="$(echo "$local" | awk -F: '{print $NF}')"
+        addr="$(echo "$local" | sed "s/:$port$//")"
+
+        case "$port" in
+            22)  name="SSH 远程登录"; risk="建议只放行你的 SSH 端口，并配合 Fail2Ban" ;;
+            80)  name="HTTP 网站"; risk="如果没有建站，可关闭或拒绝" ;;
+            443) name="HTTPS 网站"; risk="如果没有建站，可关闭或拒绝" ;;
+            53)  name="DNS 解析"; risk="127.0.0.1/127.0.0.53/127.0.0.54 通常是本机 DNS，公网监听需谨慎" ;;
+            25)  name="SMTP 邮件"; risk="小机器一般不建议开放，容易被滥用" ;;
+            3306) name="MySQL 数据库"; risk="强烈建议不要公网开放" ;;
+            5432) name="PostgreSQL 数据库"; risk="强烈建议不要公网开放" ;;
+            6379) name="Redis 数据库"; risk="强烈建议不要公网开放" ;;
+            27017) name="MongoDB 数据库"; risk="强烈建议不要公网开放" ;;
+            *) continue ;;
+        esac
+
+        has_common=1
+        echo "- ${proto^^} ${port}：${name}；监听地址：${addr}；提示：${risk}"
+    done < "$tmp"
+
+    if [ "$has_common" = 0 ]; then
+        echo "未发现常见高风险端口。"
+    fi
+
+    echo
+    public_count="$(awk '
+        {
+            local=$5
+            if (local ~ /\[::\]:/ || local ~ /^:::/ || local ~ /^0\.0\.0\.0:/) c++
+        }
+        END{print c+0}
+    ' "$tmp")"
+
+    if [ "$public_count" -gt 0 ]; then
+        echo "风险提示：检测到 ${public_count} 个可能监听在公网地址的端口。"
+        echo "建议：确认这些端口是否真的需要对外开放，并用 UFW 限制。"
+    else
+        echo "公网监听风险：未发现明显 0.0.0.0 或 :: 全网监听。"
+    fi
+
+    rm -f "$tmp"
 }
 
 show_fail2ban_status_summary() {
@@ -490,9 +597,8 @@ security_self_check() {
             warn "底层规则中未明显检测到 UFW，需手动确认"
         fi
 
-        echo
-        echo "UFW 当前规则："
-        ufw status numbered
+        rule_count="$(ufw status numbered 2>/dev/null | grep -c '^\[' || true)"
+        echo "UFW 规则数量：${rule_count}"
     else
         danger "UFW 未安装"
     fi
@@ -539,11 +645,8 @@ security_self_check() {
         ok "未检测到运行中的 Docker"
     fi
 
-    if ss -tulpen >/dev/null 2>&1; then
-        echo
-        echo "监听端口摘要："
-        ss -tulpen | awk 'NR==1 || /LISTEN|UNCONN/' | head -n 20
-    fi
+    echo
+    show_port_summary
 
     echo
     [ "$score" -lt 0 ] && score=0
@@ -567,21 +670,25 @@ ufw_menu() {
     while true; do
         clear
         echo "===== UFW ====="
-        echo "1. 状态"
-        echo "2. 规则"
+        echo "1. 状态摘要"
+        echo "2. 规则列表"
         echo "3. 放行端口"
         echo "4. 拒绝端口"
         echo "5. 删除规则"
         echo "6. 启用/禁用/重载/重置"
-        echo "7. 日志分析"
+        echo "7. 拦截分析"
         echo "0. 返回"
         echo
 
         read -rp "选择：" c
 
         case "$c" in
-            1) ufw status verbose ;;
-            2) ufw status numbered ;;
+            1)
+                ufw status verbose
+                ;;
+            2)
+                ufw status numbered
+                ;;
             3)
                 read -rp "端口，例如 80 或 443/tcp：" port
                 ufw allow "$port" comment "用户允许规则"
@@ -625,7 +732,7 @@ fail2ban_menu() {
         echo "2. 编辑基础配置"
         echo "3. 启用扫描器"
         echo "4. 解封 IP"
-        echo "5. 日志分析"
+        echo "5. 封禁分析"
         echo "6. 测试/重启"
         echo "7. 查看配置"
         echo "0. 返回"
@@ -745,6 +852,7 @@ full_cleanup_all() {
 main_menu() {
     need_root
     install_self_alias
+    install_log_limit >/dev/null 2>&1 || true
 
     while true; do
         clear
@@ -759,7 +867,7 @@ main_menu() {
         echo "3. Fail2Ban 管理"
         echo "4. 自检评分"
         echo "5. 日志分析"
-        echo "6. 日志限 7 天"
+        echo "6. 主动清理日志"
         echo "7. 卸载菜单"
         echo "0. 退出"
         echo
@@ -775,9 +883,11 @@ main_menu() {
                 analyze_ufw_logs
                 echo
                 analyze_fail2ban_logs
+                echo
+                show_port_summary
                 pause
                 ;;
-            6) install_log_limit; pause ;;
+            6) clean_security_logs; pause ;;
             7)
                 clear
                 echo "===== 卸载菜单 ====="
