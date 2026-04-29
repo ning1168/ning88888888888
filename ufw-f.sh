@@ -97,7 +97,7 @@ port_name(){
 }
 
 show_ufw_summary(){
-    echo "========== UFW 防火墙中文摘要 =========="
+    echo "========== UFW 防火墙状态摘要 =========="
     command -v ufw >/dev/null 2>&1 || { echo "UFW 未安装。"; return; }
 
     v="$(ufw status verbose 2>/dev/null || true)"
@@ -107,17 +107,24 @@ show_ufw_summary(){
     echo "$v" | grep -qi "allow (outgoing)" && echo "默认出站：允许，正常" || echo "默认出站：不是允许，请确认"
 
     echo
-    echo "规则中文摘要："
-    ufw status | awk 'NR>4 && $0 !~ /^--/ && NF>=3' | while read -r line; do
-        to="$(echo "$line" | awk '{print $1}')"
-        action="$(echo "$line" | grep -q "ALLOW" && echo "放行" || echo "$line" | grep -q "DENY" && echo "拒绝" || echo "其他")"
-        port="$(echo "$to" | sed 's/(v6)//g;s#/tcp##;s#/udp##' | xargs)"
-        proto="自动"; echo "$to" | grep -q "/tcp" && proto="TCP"; echo "$to" | grep -q "/udp" && proto="UDP"
-        echo "$to" | grep -q "(v6)" && ipver="IPv6" || ipver="IPv4"
-        [ -n "$port" ] && echo "- ${action} ${port}，协议 ${proto}，${ipver}，说明：$(port_name "$port")"
-    done
+    echo "说明："
+    echo "ALLOW IN = 允许外部访问本机端口"
+    echo "DENY IN  = 拒绝外部访问本机端口"
+    echo "(v6)     = IPv6 规则"
+    echo
+    echo "========== UFW 原生规则列表 =========="
+    ufw status numbered
 }
 
+show_ufw_rules_native(){
+    echo "========== UFW 规则列表 =========="
+    echo "说明："
+    echo "ALLOW IN = 放行"
+    echo "DENY IN  = 拒绝"
+    echo "(v6)     = IPv6"
+    echo
+    ufw status numbered
+}
 batch_allow_ports(){
     echo "可一次输入多个端口，例如：80 443 8443"
     echo "也支持协议：80/tcp 53/udp"
@@ -144,21 +151,15 @@ batch_deny_ports(){
 
 delete_ufw_rule_cn(){
     echo "========== 删除 UFW 规则 =========="
-    mapfile -t rules < <(ufw status numbered 2>/dev/null | grep '^\[')
-    [ "${#rules[@]}" -eq 0 ] && echo "没有可删除的规则。" && return
-
-    for r in "${rules[@]}"; do
-        num="$(echo "$r" | sed -n 's/^\[\s*\([0-9]\+\)\].*/\1/p')"
-        to="$(echo "$r" | sed 's/^\[[^]]*\]//' | awk '{print $1}')"
-        action="$(echo "$r" | grep -q "ALLOW" && echo "放行" || echo "$r" | grep -q "DENY" && echo "拒绝" || echo "规则")"
-        port="$(echo "$to" | sed 's/(v6)//g;s#/tcp##;s#/udp##' | xargs)"
-        echo "编号 ${num}：${action}端口 ${port}，说明：$(port_name "$port")"
-    done
-
+    echo "下面显示的是 UFW 原生编号列表，删除时请输入最左边 [] 里的编号。"
+    echo "注意：删除 IPv4 和 IPv6 规则通常要分别删除。"
+    echo
+    ufw status numbered
+    echo
     read -rp "输入要删除的编号：" num
-    [ -n "$num" ] && ufw delete "$num"
+    [ -z "$num" ] && echo "未输入。" && return
+    ufw delete "$num"
 }
-
 analyze_fail2ban_error(){
     echo "========== Fail2Ban 启动失败分析 =========="
     err="$(journalctl -u fail2ban -n 80 --no-pager 2>/dev/null; cat /tmp/f2b-test.log 2>/dev/null)"
@@ -407,7 +408,7 @@ ufw_menu(){
         clear
         echo "===== UFW ====="
         echo "1. 状态摘要"
-        echo "2. 规则中文列表"
+        echo "2. 原生规则列表"
         echo "3. 批量放行端口"
         echo "4. 批量拒绝端口"
         echo "5. 删除规则"
@@ -416,7 +417,8 @@ ufw_menu(){
         echo "0. 返回"
         read -rp "选择：" c
         case "$c" in
-            1|2) show_ufw_summary ;;
+            1) show_ufw_summary ;;
+            2) show_ufw_rules_native ;;
             3) batch_allow_ports ;;
             4) batch_deny_ports ;;
             5) delete_ufw_rule_cn ;;
@@ -479,14 +481,56 @@ uninstall_menu(){
     echo "0. 返回"
     read -rp "选择：" x
     case "$x" in
-        1) rm -f "$SELF_MENU" "$WRAPPER_UFW" "$LOGROTATE_FILE"; echo "脚本入口已清理。" ;;
-        2) ufw --force disable >/dev/null 2>&1 || true; apt purge -y ufw; apt autoremove -y; rm -rf /etc/ufw "$WRAPPER_UFW"; echo "UFW 已卸载。" ;;
-        3) systemctl stop fail2ban >/dev/null 2>&1 || true; systemctl disable fail2ban >/dev/null 2>&1 || true; apt purge -y fail2ban; apt autoremove -y; rm -rf /etc/fail2ban; echo "Fail2Ban 已卸载。" ;;
-        4) systemctl stop fail2ban >/dev/null 2>&1 || true; ufw --force disable >/dev/null 2>&1 || true; apt purge -y fail2ban ufw; apt autoremove -y; rm -rf /etc/fail2ban /etc/ufw; rm -f "$SELF_MENU" "$WRAPPER_UFW" "$LOGROTATE_FILE"; echo "已全部清理。" ;;
+        1)
+            echo "将删除快捷入口和脚本菜单："
+            echo "$SELF_MENU"
+            echo "$WRAPPER_UFW"
+            echo "$LOGROTATE_FILE"
+            echo
+            read -rp "确认仅卸载本脚本？输入 YES：" yes
+            [ "$yes" = "YES" ] || return
+            rm -f "$SELF_MENU" "$WRAPPER_UFW" "$LOGROTATE_FILE"
+            echo "脚本入口已清理。"
+            echo "如果你是用当前目录脚本运行的，请再执行："
+            echo "rm -f ./ufw-f-v5.sh ./ufw-f-v4.sh ./ufw-f.sh"
+            echo
+            echo "现在退出菜单。"
+            exit 0
+            ;;
+        2)
+            read -rp "确认卸载 UFW？输入 YES：" yes
+            [ "$yes" = "YES" ] || return
+            ufw --force disable >/dev/null 2>&1 || true
+            apt purge -y ufw
+            apt autoremove -y
+            rm -rf /etc/ufw "$WRAPPER_UFW"
+            echo "UFW 已卸载。"
+            ;;
+        3)
+            read -rp "确认卸载 Fail2Ban？输入 YES：" yes
+            [ "$yes" = "YES" ] || return
+            systemctl stop fail2ban >/dev/null 2>&1 || true
+            systemctl disable fail2ban >/dev/null 2>&1 || true
+            apt purge -y fail2ban
+            apt autoremove -y
+            rm -rf /etc/fail2ban
+            echo "Fail2Ban 已卸载。"
+            ;;
+        4)
+            read -rp "确认全部清理？输入 YES：" yes
+            [ "$yes" = "YES" ] || return
+            systemctl stop fail2ban >/dev/null 2>&1 || true
+            ufw --force disable >/dev/null 2>&1 || true
+            apt purge -y fail2ban ufw
+            apt autoremove -y
+            rm -rf /etc/fail2ban /etc/ufw
+            rm -f "$SELF_MENU" "$WRAPPER_UFW" "$LOGROTATE_FILE"
+            echo "已全部清理。"
+            exit 0
+            ;;
     esac
     pause
 }
-
 main_menu(){
     need_root
     install_self_alias
@@ -494,7 +538,7 @@ main_menu(){
     while true; do
         clear
         check_tools
-        echo "===== UFW-F 管理 v4 ====="
+        echo "===== UFW-F 管理 v5 ====="
         [ "$UFW_OK" = 1 ] && echo "UFW：已安装" || echo "UFW：未安装"
         [ "$F2B_OK" = 1 ] && echo "Fail2Ban：已安装" || echo "Fail2Ban：未安装"
         echo
