@@ -234,6 +234,8 @@ dashboard() {
 
     echo
     show_public_ports
+    echo
+    check_abnormal_open_ports
 }
 
 # ==================================================
@@ -589,6 +591,101 @@ fail2ban_menu() {
     done
 }
 
+
+# ==================================================
+# 异常开放端口检测
+# ==================================================
+
+ufw_allowed_ports_cache() {
+    ufw status 2>/dev/null \
+        | awk 'NR>4 && $0 !~ /^--/ && /ALLOW/ {print $1}' \
+        | sed 's/(v6)//g;s#/tcp##;s#/udp##' \
+        | xargs -n1 2>/dev/null \
+        | sort -u
+}
+
+check_abnormal_open_ports() {
+    title "异常开放端口检测"
+
+    echo "检测逻辑：对外监听端口 vs UFW放行规则"
+    echo "如果端口对外监听，但UFW没明显放行，可能是Docker/面板/iptables绕过。"
+    echo
+
+    if ! command -v ss >/dev/null 2>&1; then
+        bad "未找到ss命令，无法检测。"
+        return
+    fi
+
+    tmp="$(mktemp)"
+    pub="$(mktemp)"
+    allow="$(mktemp)"
+    abnormal="$(mktemp)"
+
+    ss -tulpenH 2>/dev/null > "$tmp"
+
+    awk '
+        {
+            local=$5
+            if (local !~ /^127\./ && local !~ /^\[::1\]/ && local !~ /^::1:/ && local !~ /^localhost:/) print
+        }
+    ' "$tmp" > "$pub"
+
+    ufw_allowed_ports_cache > "$allow"
+
+    if [ ! -s "$pub" ]; then
+        ok "未发现对外监听端口。"
+        rm -f "$tmp" "$pub" "$allow" "$abnormal"
+        return
+    fi
+
+    awk '
+    {
+        proto=toupper($1)
+        local=$5
+        port=local
+        sub(/^.*:/,"",port)
+
+        proc="未知进程"
+        if ($0 ~ /users:\(\("/) {
+            proc=$0
+            sub(/^.*users:\(\("/,"",proc)
+            sub(/".*$/,"",proc)
+        }
+
+        key=proto ":" port ":" proc
+        if (!seen[key]++) print proto, port, proc
+    }' "$pub" | while read -r proto port proc; do
+        if grep -qx "$port" "$allow"; then
+            continue
+        fi
+
+        echo "$proto|$port|$proc" >> "$abnormal"
+
+        if echo "$proc" | grep -qi "docker-proxy"; then
+            bad "${proto} ${port}（$(port_name "$port")）疑似Docker绕过UFW"
+            echo "  进程：$proc"
+            echo "  建议：Docker端口改成 127.0.0.1:${port}:${port}，或确认确实需要公网暴露"
+        else
+            warn "${proto} ${port}（$(port_name "$port")）未在UFW放行规则中，但正在对外监听"
+            echo "  进程：$proc"
+            echo "  中文：$(service_cn_name "$proc")"
+            echo "  建议：确认是否由面板、iptables、Docker或其他程序开放"
+        fi
+
+        if is_danger_port "$port"; then
+            echo "  风险：这是高风险端口，不建议公网开放"
+        fi
+
+        echo
+    done
+
+    if [ ! -s "$abnormal" ]; then
+        ok "未发现明显异常开放端口。"
+    fi
+
+    rm -f "$tmp" "$pub" "$allow" "$abnormal"
+}
+
 # ==================================================
 # 查看分析
 # ==================================================
@@ -703,6 +800,7 @@ view_menu() {
         echo "1. 对外端口/服务"
         echo "2. UFW拦截日志分析"
         echo "3. Fail2Ban封禁日志分析"
+        echo "4. 异常开放端口检测"
         echo "0. 返回"
         echo
 
@@ -711,6 +809,7 @@ view_menu() {
             1) show_public_ports; pause ;;
             2) analyze_ufw_logs; pause ;;
             3) analyze_fail2ban_logs; pause ;;
+            4) check_abnormal_open_ports; pause ;;
             0) return ;;
             *) warn "无效选择"; pause ;;
         esac
