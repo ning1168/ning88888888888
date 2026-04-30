@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# UFW / Fail2Ban 中文轻量管理脚本 v4
+# UFW-F 最终优化版
 # sudo ufw -f 进入菜单
 
 set -u
@@ -8,6 +8,7 @@ REAL_UFW="/usr/sbin/ufw"
 SELF_MENU="/usr/local/sbin/ufw-f-menu"
 WRAPPER_UFW="/usr/local/sbin/ufw"
 LOGROTATE_FILE="/etc/logrotate.d/ufw-fail2ban-lite"
+BACKUP_DIR="/root/ufw-f-backup"
 
 need_root(){ [ "$(id -u)" -eq 0 ] || { echo "请用 root 运行：sudo $0"; exit 1; }; }
 pause(){ echo; read -rp "按回车继续..."; }
@@ -96,6 +97,24 @@ port_name(){
     esac
 }
 
+
+is_danger_port(){
+    case "$1" in
+        21|25|3306|5432|6379|27017) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+backup_configs(){
+    mkdir -p "$BACKUP_DIR"
+    ts="$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$BACKUP_DIR/$ts"
+    [ -d /etc/ufw ] && cp -a /etc/ufw "$BACKUP_DIR/$ts/" 2>/dev/null || true
+    [ -d /etc/fail2ban ] && cp -a /etc/fail2ban "$BACKUP_DIR/$ts/" 2>/dev/null || true
+    ufw status numbered >"$BACKUP_DIR/$ts/ufw-status.txt" 2>/dev/null || true
+    echo "已备份到：$BACKUP_DIR/$ts"
+}
+
 show_ufw_summary(){
     echo "========== UFW 防火墙状态摘要 =========="
     command -v ufw >/dev/null 2>&1 || { echo "UFW 未安装。"; return; }
@@ -130,6 +149,7 @@ batch_allow_ports(){
     echo "也支持协议：80/tcp 53/udp"
     read -rp "放行端口：" ports
     [ -z "$ports" ] && echo "未输入。" && return
+    backup_configs
     for p in $ports; do
         ufw allow "$p" comment "用户允许规则"
         clean="$(echo "$p" | sed 's#/.*##')"
@@ -142,6 +162,7 @@ batch_deny_ports(){
     echo "也支持协议：3306/tcp 53/udp"
     read -rp "拒绝端口：" ports
     [ -z "$ports" ] && echo "未输入。" && return
+    backup_configs
     for p in $ports; do
         ufw deny "$p" comment "用户拒绝规则"
         clean="$(echo "$p" | sed 's#/.*##')"
@@ -189,7 +210,7 @@ install_ufw(){
     ufw allow "${ssh_port}/tcp" comment "SSH 远程连接端口"
     ufw default deny incoming
     ufw default allow outgoing
-    ufw logging on
+    ufw logging low
     read -rp "是否启用 UFW？默认 Y：[Y/n] " yn
     yn="${yn:-Y}"
     case "$yn" in y|Y) ufw --force enable ;; *) echo "已跳过启用 UFW。" ;; esac
@@ -252,6 +273,11 @@ install_fail2ban(){
 }
 
 install_scanner_jail(){
+    echo "说明：扫描器会读取 UFW 日志，自动封禁频繁扫端口的 IP。"
+    echo "1核1G 小机器默认不建议开启，除非经常被扫描。"
+    read -rp "确认启用 ufw-scanner？输入 YES：" yes
+    [ "$yes" = "YES" ] || return
+    backup_configs
     command -v fail2ban-client >/dev/null 2>&1 || { echo "请先安装 Fail2Ban。"; pause; return; }
     ensure_log_files
     mkdir -p /etc/fail2ban/filter.d /etc/fail2ban/jail.d
@@ -268,12 +294,12 @@ enabled = true
 logpath = /var/log/ufw.log
 filter = ufw-scanner
 findtime = 10m
-maxretry = 8
+maxretry = 12
 bantime = 6h
 banaction = ufw
 backend = polling
 EOF
-    ufw logging on >/dev/null 2>&1 || true
+    ufw logging low >/dev/null 2>&1 || true
     safe_restart_fail2ban && echo "扫描器已启用：ufw-scanner"
     pause
 }
@@ -309,40 +335,63 @@ analyze_fail2ban_logs(){
 }
 
 show_port_summary(){
-    echo "========== 监听端口中文摘要 =========="
+    echo "========== 公网监听端口分析 =========="
     command -v ss >/dev/null 2>&1 || { echo "未找到 ss 命令。"; return; }
+
     tmp="$(mktemp)"
     ss -tulpenH 2>/dev/null > "$tmp"
+
     [ ! -s "$tmp" ] && { echo "未检测到监听端口。"; rm -f "$tmp"; return; }
 
-    echo "监听总数：$(wc -l < "$tmp" | xargs)"
-    echo "TCP 监听：$(awk '$1=="tcp"{c++} END{print c+0}' "$tmp")"
-    echo "UDP 监听：$(awk '$1=="udp"{c++} END{print c+0}' "$tmp")"
+    awk '$5 ~ /^0\.0\.0\.0:/ || $5 ~ /^\[::\]:/ || $5 ~ /^:::/ || $5 ~ /^\*:/' "$tmp" > "$tmp.public"
+
+    if [ ! -s "$tmp.public" ]; then
+        echo "未发现明显公网监听端口。"
+        rm -f "$tmp" "$tmp.public"
+        return
+    fi
+
+    echo "公网监听数量：$(wc -l < "$tmp.public" | xargs)"
     echo
-    echo "监听明细："
+    echo "公网监听明细："
 
     awk '
     {
-        proto=$1; local=$5; port=local; sub(/^.*:/,"",port);
-        addr=local; sub(":" port "$","",addr);
-        proc="-";
-        if ($0 ~ /users:\(\("/) { proc=$0; sub(/^.*users:\(\("/,"",proc); sub(/".*$/,"",proc); }
-        key=proto ":" port ":" addr ":" proc;
-        if (!seen[key]++) print proto, port, addr, proc;
-    }' "$tmp" | while read -r proto port addr proc; do
-        [ -z "$port" ] && continue
-        case "$addr" in 127.*|::1|localhost*) scope="本机监听" ;; 0.0.0.0|::|\[::\]|*) scope="可能公网监听" ;; esac
+        proto=$1
+        local=$5
+        port=local
+        sub(/^.*:/,"",port)
+        proc="-"
+        if ($0 ~ /users:\(\("/) {
+            proc=$0
+            sub(/^.*users:\(\("/,"",proc)
+            sub(/".*$/,"",proc)
+        }
+        key=proto ":" port ":" proc
+        if (!seen[key]++) print proto, port, proc
+    }' "$tmp.public" | while read -r proto port proc; do
         upper="$(echo "$proto" | tr '[:lower:]' '[:upper:]')"
         [ "$proc" = "-" ] && svc="$(port_name "$port")" || svc="$proc"
-        echo "- ${upper} ${port}：$(port_name "$port")；范围：${scope}；进程/服务：${svc}"
+        if is_danger_port "$port"; then
+            echo "❌ ${upper} ${port}：$(port_name "$port")；进程/服务：${svc}；风险：不建议公网开放"
+        else
+            echo "- ${upper} ${port}：$(port_name "$port")；进程/服务：${svc}"
+        fi
     done
 
-    public_count="$(awk '{local=$5; if (local ~ /\[::\]:/ || local ~ /^:::/ || local ~ /^0\.0\.0\.0:/ || local ~ /^\*:/) c++} END{print c+0}' "$tmp")"
     echo
-    echo "风险提示：检测到 ${public_count} 个明显全网监听端口。"
-    rm -f "$tmp"
-}
+    echo "危险端口检查："
+    danger=0
+    for p in 21 25 3306 5432 6379 27017; do
+        if grep -Eq ":${p}[[:space:]]" "$tmp.public"; then
+            echo "❌ 发现公网监听危险端口 ${p}：$(port_name "$p")"
+            danger=1
+        fi
+    done
+    [ "$danger" = 0 ] && echo "未发现常见数据库/邮件/FTP 危险端口公网监听。"
 
+    rm -f "$tmp" "$tmp.public"
+}
 show_fail2ban_status_summary(){
     echo "========== Fail2Ban 防护摘要 =========="
     command -v fail2ban-client >/dev/null 2>&1 || { echo "Fail2Ban 未安装。"; return; }
@@ -403,6 +452,24 @@ security_self_check(){
     [ "$score" -ge 85 ] && echo "评级：优秀" || [ "$score" -ge 70 ] && echo "评级：良好" || [ "$score" -ge 50 ] && echo "评级：一般" || echo "评级：较危险"
 }
 
+
+minimal_safe_mode(){
+    echo "========== 最小安全模式 =========="
+    echo "作用：重置 UFW，只放行 SSH 端口，默认入站拒绝。"
+    read -rp "SSH 端口，默认 22：" ssh_port
+    ssh_port="${ssh_port:-22}"
+    read -rp "确认重置 UFW 并只放行 SSH？输入 YES：" yes
+    [ "$yes" = "YES" ] || return
+    backup_configs
+    ufw --force reset
+    ufw default deny incoming
+    ufw default allow outgoing
+    ufw allow "${ssh_port}/tcp" comment "SSH 远程连接端口"
+    ufw logging low
+    ufw --force enable
+    echo "最小安全模式已应用：只放行 SSH ${ssh_port}/tcp。"
+}
+
 ufw_menu(){
     while true; do
         clear
@@ -414,6 +481,7 @@ ufw_menu(){
         echo "5. 删除规则"
         echo "6. 启用/禁用/重载/重置"
         echo "7. 拦截分析"
+        echo "8. 最小安全模式"
         echo "0. 返回"
         read -rp "选择：" c
         case "$c" in
@@ -432,11 +500,35 @@ ufw_menu(){
                     4) read -rp "确认重置？输入 YES：" yes; [ "$yes" = "YES" ] && ufw --force reset ;;
                 esac ;;
             7) analyze_ufw_logs ;;
+            8) minimal_safe_mode ;;
             0) return ;;
             *) echo "无效选择。" ;;
         esac
         pause
     done
+}
+
+
+disable_scanner_jail(){
+    if [ -f /etc/fail2ban/jail.d/ufw-scanner.local ]; then
+        backup_configs
+        mv /etc/fail2ban/jail.d/ufw-scanner.local /etc/fail2ban/jail.d/ufw-scanner.local.disabled
+        systemctl restart fail2ban >/dev/null 2>&1 || true
+        echo "已禁用 ufw-scanner。"
+    else
+        echo "未发现已启用的 ufw-scanner。"
+    fi
+}
+
+install_recommended_security(){
+    echo "推荐模式：UFW + Fail2Ban SSH 防爆破 + 日志 7 天限制。"
+    echo "不会默认启用 ufw-scanner。"
+    pause
+    install_ufw
+    install_fail2ban
+    install_log_limit
+    echo "推荐安全配置完成。"
+    pause
 }
 
 fail2ban_menu(){
@@ -445,25 +537,27 @@ fail2ban_menu(){
         echo "===== Fail2Ban ====="
         echo "1. 防护摘要"
         echo "2. 编辑基础配置"
-        echo "3. 启用扫描器"
-        echo "4. 解封 IP"
-        echo "5. 封禁分析"
-        echo "6. 测试/重启"
-        echo "7. 查看配置"
+        echo "3. 启用 ufw-scanner 扫描器"
+        echo "4. 禁用 ufw-scanner 扫描器"
+        echo "5. 解封 IP"
+        echo "6. 封禁分析"
+        echo "7. 测试/重启"
+        echo "8. 查看配置"
         echo "0. 返回"
         read -rp "选择：" c
         case "$c" in
             1) show_fail2ban_status_summary ;;
             2) edit_fail2ban_basic_config; safe_restart_fail2ban ;;
             3) install_scanner_jail ;;
-            4)
+            4) disable_scanner_jail ;;
+            5)
                 read -rp "IP：" ip
                 jails="$(fail2ban-client status 2>/dev/null | awk -F: '/Jail list/ {print $2}' | tr ',' ' ')"
                 for jail in $jails; do fail2ban-client set "$(echo "$jail" | xargs)" unbanip "$ip" >/dev/null 2>&1 || true; done
                 echo "已尝试解封：$ip" ;;
-            5) analyze_fail2ban_logs ;;
-            6) fail2ban-client -t >/tmp/f2b-test.log 2>&1 && { echo "配置测试通过。"; systemctl restart fail2ban; } || analyze_fail2ban_error ;;
-            7) cat /etc/fail2ban/jail.local 2>/dev/null || echo "未找到配置。" ;;
+            6) analyze_fail2ban_logs ;;
+            7) fail2ban-client -t >/tmp/f2b-test.log 2>&1 && { echo "配置测试通过。"; systemctl restart fail2ban; } || analyze_fail2ban_error ;;
+            8) cat /etc/fail2ban/jail.local 2>/dev/null || echo "未找到配置。" ;;
             0) return ;;
             *) echo "无效选择。" ;;
         esac
@@ -492,7 +586,7 @@ uninstall_menu(){
             rm -f "$SELF_MENU" "$WRAPPER_UFW" "$LOGROTATE_FILE"
             echo "脚本入口已清理。"
             echo "如果你是用当前目录脚本运行的，请再执行："
-            echo "rm -f ./ufw-f-v5.sh ./ufw-f-v4.sh ./ufw-f.sh"
+            echo "rm -f ./ufw-f-final.sh ./ufw-f-v5.sh ./ufw-f.sh"
             echo
             echo "现在退出菜单。"
             exit 0
@@ -538,27 +632,29 @@ main_menu(){
     while true; do
         clear
         check_tools
-        echo "===== UFW-F 管理 v5 ====="
+        echo "===== UFW-F 最终版 ====="
         [ "$UFW_OK" = 1 ] && echo "UFW：已安装" || echo "UFW：未安装"
         [ "$F2B_OK" = 1 ] && echo "Fail2Ban：已安装" || echo "Fail2Ban：未安装"
         echo
-        echo "1. 一键安装"
+        echo "1. 推荐安装"
         echo "2. UFW 管理"
         echo "3. Fail2Ban 管理"
         echo "4. 自检评分"
-        echo "5. 日志/端口分析"
+        echo "5. 日志/公网端口分析"
         echo "6. 主动清理日志"
-        echo "7. 卸载菜单"
+        echo "7. 备份配置"
+        echo "8. 卸载菜单"
         echo "0. 退出"
         read -rp "选择：" c
         case "$c" in
-            1) install_all_security ;;
+            1) install_recommended_security ;;
             2) ufw_menu ;;
             3) fail2ban_menu ;;
             4) security_self_check; pause ;;
             5) analyze_ufw_logs; echo; analyze_fail2ban_logs; echo; show_port_summary; pause ;;
             6) clean_security_logs; pause ;;
-            7) uninstall_menu ;;
+            7) backup_configs; pause ;;
+            8) uninstall_menu ;;
             0) exit 0 ;;
             *) echo "无效选择。"; pause ;;
         esac
