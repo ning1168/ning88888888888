@@ -9,6 +9,7 @@ SELF_MENU="/usr/local/sbin/ufw-f-menu"
 WRAPPER_UFW="/usr/local/sbin/ufw"
 LOGROTATE_FILE="/etc/logrotate.d/ufw-fail2ban-lite"
 BACKUP_DIR="/root/ufw-f-backup"
+CURRENT_SCRIPT="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 
 need_root(){ [ "$(id -u)" -eq 0 ] || { echo "请用 root 运行：sudo $0"; exit 1; }; }
 pause(){ echo; read -rp "按回车继续..."; }
@@ -335,7 +336,7 @@ analyze_fail2ban_logs(){
 }
 
 show_port_summary(){
-    echo "========== 公网监听端口分析 =========="
+    echo "========== 当前公网占用端口 / 服务分析 =========="
     command -v ss >/dev/null 2>&1 || { echo "未找到 ss 命令。"; return; }
 
     tmp="$(mktemp)"
@@ -353,29 +354,36 @@ show_port_summary(){
 
     echo "公网监听数量：$(wc -l < "$tmp.public" | xargs)"
     echo
+    echo "说明：公网监听表示外部网络可能访问到这个端口，是否真的能访问还要看 UFW 和云安全组。"
+    echo
     echo "公网监听明细："
 
     awk '
     {
-        proto=$1
-        local=$5
-        port=local
-        sub(/^.*:/,"",port)
-        proc="-"
+        proto=$1; local=$5; port=local; sub(/^.*:/,"",port);
+        proc="-"; pid="-";
         if ($0 ~ /users:\(\("/) {
-            proc=$0
-            sub(/^.*users:\(\("/,"",proc)
-            sub(/".*$/,"",proc)
+            proc=$0; sub(/^.*users:\(\("/,"",proc); sub(/".*$/,"",proc);
+            pid=$0; sub(/^.*pid=/,"",pid); sub(/,.*/,"",pid);
+            if (pid !~ /^[0-9]+$/) pid="-";
         }
-        key=proto ":" port ":" proc
-        if (!seen[key]++) print proto, port, proc
-    }' "$tmp.public" | while read -r proto port proc; do
+        key=proto ":" port ":" proc ":" pid;
+        if (!seen[key]++) print proto, port, proc, pid;
+    }' "$tmp.public" | while read -r proto port proc pid; do
         upper="$(echo "$proto" | tr '[:lower:]' '[:upper:]')"
-        [ "$proc" = "-" ] && svc="$(port_name "$port")" || svc="$proc"
-        if is_danger_port "$port"; then
-            echo "❌ ${upper} ${port}：$(port_name "$port")；进程/服务：${svc}；风险：不建议公网开放"
+
+        if [ "$proc" = "-" ] || [ -z "$proc" ]; then
+            service="$(port_name "$port")"
+            proc_show="未知进程"
         else
-            echo "- ${upper} ${port}：$(port_name "$port")；进程/服务：${svc}"
+            service="$proc"
+            proc_show="$proc"
+        fi
+
+        if is_danger_port "$port"; then
+            echo "❌ ${upper} ${port}：$(port_name "$port")；运行服务：${service}；进程：${proc_show}；风险：不建议公网开放"
+        else
+            echo "- ${upper} ${port}：$(port_name "$port")；运行服务：${service}；进程：${proc_show}"
         fi
     done
 
@@ -576,18 +584,23 @@ uninstall_menu(){
     read -rp "选择：" x
     case "$x" in
         1)
-            echo "将删除快捷入口和脚本菜单："
+            echo "会删除本脚本相关文件："
             echo "$SELF_MENU"
             echo "$WRAPPER_UFW"
             echo "$LOGROTATE_FILE"
+            echo "$CURRENT_SCRIPT"
             echo
+            echo "不会卸载 UFW / Fail2Ban。"
             read -rp "确认仅卸载本脚本？输入 YES：" yes
             [ "$yes" = "YES" ] || return
+
             rm -f "$SELF_MENU" "$WRAPPER_UFW" "$LOGROTATE_FILE"
-            echo "脚本入口已清理。"
-            echo "如果你是用当前目录脚本运行的，请再执行："
-            echo "rm -f ./ufw-f-final.sh ./ufw-f-v5.sh ./ufw-f.sh"
-            echo
+
+            if [ -f "$CURRENT_SCRIPT" ] && echo "$CURRENT_SCRIPT" | grep -q "^/"; then
+                rm -f "$CURRENT_SCRIPT"
+            fi
+
+            echo "本脚本已清理完成。"
             echo "现在退出菜单。"
             exit 0
             ;;
@@ -640,7 +653,7 @@ main_menu(){
         echo "2. UFW 管理"
         echo "3. Fail2Ban 管理"
         echo "4. 自检评分"
-        echo "5. 日志/公网端口分析"
+        echo "5. 日志/公网端口/服务分析"
         echo "6. 主动清理日志"
         echo "7. 备份配置"
         echo "8. 卸载菜单"
