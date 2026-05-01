@@ -1,22 +1,21 @@
 #!/usr/bin/env bash
 # ============================================================
-# Docker + Nginx + HTTPS 小白工具箱 v7
+# Docker + Nginx + HTTPS 小白工具箱 v8
 # 适合：Debian / Ubuntu
 #
-# 修复重点：
-# - 取消/回车不再退出脚本
-# - Docker 项目选择、日志、更新、停止、重启逻辑修复
-# - Nginx 禁用/删除选择逻辑修复
-# - Nginx 删除会同时处理 sites-enabled 和 sites-available
-# - 已有配置只提供：覆盖 / 取消，不再生成备份文件
-# - 新增 Nginx 空模板
-# - HTTPS 证书独立管理
+# 本版重点：
+# - 不使用 set -e，避免取消/回车导致整个脚本退出
+# - Nginx 创建反代前会检测现有配置错误
+# - 增加“修复证书引用”功能，专门处理证书文件被删但 Nginx 还引用的问题
+# - 已有文件只提供：覆盖 / 取消，不再生成备份文件
+# - 启用 Nginx 站点失败会自动撤销启用，避免把 Nginx 搞坏
+# - Docker 修改 docker-compose.yml 后，用“启动/应用配置”才会生效
+# - 安装检测逻辑减少重复 apt 操作
 #
 # 默认 Docker 项目目录：/docker
 # 配置记忆文件：/root/.docker-nginx-tool/config
 # ============================================================
 
-# 交互脚本不使用 set -e，避免用户取消/回车时直接退出整个脚本
 set -o pipefail
 
 RED="\033[31m"
@@ -25,7 +24,7 @@ YELLOW="\033[33m"
 BLUE="\033[34m"
 NC="\033[0m"
 
-VERSION="2026.05.01-v7"
+VERSION="2026.05.01-v8"
 CONF_DIR="/root/.docker-nginx-tool"
 CONF_FILE="$CONF_DIR/config"
 DEFAULT_BASE="/docker"
@@ -142,10 +141,208 @@ confirm_overwrite_file(){
   esac
 }
 
+# ----------------------------
+# Nginx 安全检查 / 证书引用修复
+# ----------------------------
+
+nginx_config_test_quiet(){
+  nginx -t >/tmp/nginx_check.log 2>&1
+}
+
+show_nginx_test_error(){
+  if [ -f /tmp/nginx_check.log ]; then
+    cat /tmp/nginx_check.log
+  fi
+}
+
+file_has_missing_cert(){
+  local f="$1"
+  local line clean path
+  [ -f "$f" ] || return 1
+
+  while IFS= read -r line; do
+    clean="$(echo "$line" | sed 's/#.*//')"
+    echo "$clean" | grep -Eq '^[[:space:]]*ssl_certificate(_key)?[[:space:]]+' || continue
+    path="$(echo "$clean" | awk '{print $2}' | tr -d '";')"
+
+    if [ -n "$path" ] && [ ! -e "$path" ]; then
+      return 0
+    fi
+  done < "$f"
+
+  return 1
+}
+
+show_missing_cert_refs(){
+  local found=0
+  local f real line clean path
+
+  echo "缺失证书引用扫描："
+
+  for f in /etc/nginx/sites-enabled/* /etc/nginx/sites-available/*; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    real="$(readlink -f "$f" 2>/dev/null || echo "$f")"
+    [ -f "$real" ] || continue
+
+    while IFS= read -r line; do
+      clean="$(echo "$line" | sed 's/#.*//')"
+      echo "$clean" | grep -Eq '^[[:space:]]*ssl_certificate(_key)?[[:space:]]+' || continue
+      path="$(echo "$clean" | awk '{print $2}' | tr -d '";')"
+
+      if [ -n "$path" ] && [ ! -e "$path" ]; then
+        echo "- 配置：$f"
+        echo "  缺失：$path"
+        found=1
+      fi
+    done < "$real"
+  done
+
+  if [ "$found" -eq 0 ]; then
+    echo "未发现缺失证书引用"
+    return 1
+  fi
+
+  return 0
+}
+
+collect_bad_enabled_sites(){
+  local f real name
+  for f in /etc/nginx/sites-enabled/*; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    real="$(readlink -f "$f" 2>/dev/null || echo "$f")"
+    [ -f "$real" ] || continue
+
+    if file_has_missing_cert "$real"; then
+      name="$(basename "$f")"
+      echo "$name"
+    fi
+  done | sort -u
+}
+
+repair_missing_cert_refs(){
+  local bad_sites=()
+  local site
+
+  show_missing_cert_refs || return 0
+
+  mapfile -t bad_sites < <(collect_bad_enabled_sites)
+
+  if [ "${#bad_sites[@]}" -eq 0 ]; then
+    warn "发现缺失证书引用，但没有发现对应的已启用站点。请手动检查 /etc/nginx/nginx.conf"
+    return 0
+  fi
+
+  echo
+  echo "这些已启用站点引用了不存在的证书："
+  for site in "${bad_sites[@]}"; do
+    echo "- $site"
+  done
+
+  echo
+  echo "处理方式："
+  echo "1) 禁用这些有问题的站点（推荐，不删除配置文件）"
+  echo "2) 删除这些有问题的站点配置"
+  echo "0) 取消"
+  read -rp "请选择（默认 0 取消）: " c
+  c="${c:-0}"
+
+  case "$c" in
+    1)
+      for site in "${bad_sites[@]}"; do
+        rm -f "/etc/nginx/sites-enabled/$site"
+        log "已禁用：$site"
+      done
+      ;;
+    2)
+      for site in "${bad_sites[@]}"; do
+        rm -f "/etc/nginx/sites-enabled/$site"
+        rm -f "/etc/nginx/sites-available/$site"
+        log "已删除：$site"
+      done
+      ;;
+    *)
+      warn "已取消"
+      return 0
+      ;;
+  esac
+
+  if nginx_config_test_quiet; then
+    systemctl reload nginx 2>/dev/null || systemctl restart nginx
+    log "修复后 Nginx 配置检查通过并已重载"
+  else
+    err "修复后仍有 Nginx 配置错误："
+    show_nginx_test_error
+  fi
+}
+
+test_reload_nginx(){
+  if nginx_config_test_quiet; then
+    systemctl reload nginx 2>/dev/null || systemctl restart nginx
+    log "Nginx 配置检查通过并已重载"
+    return 0
+  fi
+
+  err "Nginx 配置检查失败："
+  show_nginx_test_error
+
+  if show_missing_cert_refs >/tmp/nginx_missing_cert_scan.log 2>&1; then
+    echo
+    cat /tmp/nginx_missing_cert_scan.log
+    echo
+    if ask_yn "检测到可能是证书文件缺失，是否进入修复流程？" "y"; then
+      repair_missing_cert_refs
+    fi
+  fi
+
+  return 1
+}
+
+precheck_nginx_or_continue(){
+  if nginx_config_test_quiet; then
+    return 0
+  fi
+
+  err "当前 Nginx 配置本身已经有错误，建议先修复，否则新配置也无法重载："
+  show_nginx_test_error
+
+  if show_missing_cert_refs >/tmp/nginx_missing_cert_scan.log 2>&1; then
+    echo
+    cat /tmp/nginx_missing_cert_scan.log
+    echo
+    if ask_yn "是否先修复缺失证书引用？" "y"; then
+      repair_missing_cert_refs
+    fi
+  fi
+
+  if nginx_config_test_quiet; then
+    return 0
+  fi
+
+  warn "Nginx 仍然存在配置错误。继续写文件也可能无法生效。"
+  ask_yn "是否仍继续？" "n"
+}
+
+# ----------------------------
+# 安装
+# ----------------------------
+
 install_base_tools(){
-  info "检查/安装基础工具..."
+  local pkgs=(ca-certificates curl wget gnupg lsb-release nano vim git)
+  local missing=()
+  local p
+
+  for p in "${pkgs[@]}"; do
+    dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p")
+  done
+
+  if [ "${#missing[@]}" -eq 0 ]; then
+    warn "基础工具已安装，跳过"
+    return 0
+  fi
+
+  info "安装缺失基础工具：${missing[*]}"
   apt update
-  apt install -y ca-certificates curl wget gnupg lsb-release nano vim git
+  apt install -y "${missing[@]}"
   log "基础工具已就绪"
 }
 
@@ -171,6 +368,8 @@ install_docker(){
     if [ ! -f /etc/apt/keyrings/docker.asc ]; then
       curl -fsSL "https://download.docker.com/linux/${OS_ID}/gpg" -o /etc/apt/keyrings/docker.asc
       chmod a+r /etc/apt/keyrings/docker.asc
+    else
+      warn "Docker GPG key 已存在，跳过"
     fi
 
     cat > /etc/apt/sources.list.d/docker.sources <<EOF
@@ -192,6 +391,7 @@ EOF
   fi
 
   if ! docker compose version >/dev/null 2>&1; then
+    apt update
     apt install -y docker-compose-plugin
   fi
 
@@ -201,10 +401,11 @@ EOF
 
 install_nginx(){
   if command -v nginx >/dev/null 2>&1; then
-    warn "Nginx 已安装，跳过"
+    warn "Nginx 已安装，跳过安装"
     nginx -v
   else
     install_base_tools
+    apt update
     apt install -y nginx
     log "Nginx 安装完成"
   fi
@@ -259,9 +460,7 @@ select_compose_dir(){
   if [ "${#files[@]}" -eq 0 ]; then
     warn "没有自动找到 Compose 文件"
     read -rp "手动输入项目目录（回车取消）: " manual_dir
-    if [ -z "$manual_dir" ]; then
-      return 1
-    fi
+    [ -z "$manual_dir" ] && return 1
 
     if [ ! -f "$manual_dir/docker-compose.yml" ] && [ ! -f "$manual_dir/compose.yml" ]; then
       err "该目录没有 docker-compose.yml 或 compose.yml"
@@ -282,15 +481,11 @@ select_compose_dir(){
   read -rp "请选择项目编号（默认 0 取消）: " n
   n="${n:-0}"
 
-  if [ "$n" = "0" ]; then
-    return 1
-  fi
+  [ "$n" = "0" ] && return 1
 
   if [ "$n" = "m" ] || [ "$n" = "M" ]; then
     read -rp "手动输入项目目录（回车取消）: " manual_dir
-    if [ -z "$manual_dir" ]; then
-      return 1
-    fi
+    [ -z "$manual_dir" ] && return 1
 
     if [ ! -f "$manual_dir/docker-compose.yml" ] && [ ! -f "$manual_dir/compose.yml" ]; then
       err "该目录没有 docker-compose.yml 或 compose.yml"
@@ -583,17 +778,10 @@ nginx_sites_all(){
   } | sort -u
 }
 
-test_reload_nginx(){
-  if nginx -t; then
-    systemctl reload nginx 2>/dev/null || systemctl restart nginx
-    log "Nginx 配置检查通过并已重载"
-  else
-    err "Nginx 配置检查失败，请检查配置文件"
-  fi
-}
-
 create_nginx_proxy(){
   command -v nginx >/dev/null 2>&1 || { err "未安装 Nginx，请先安装"; return 0; }
+
+  precheck_nginx_or_continue || return 0
 
   read -rp "Nginx 配置名（默认 myapp）: " name
   name="${name:-myapp}"
@@ -655,11 +843,14 @@ EOF
     ask_yn "检测到默认站点 default，是否删除" "y" && rm -f /etc/nginx/sites-enabled/default
   fi
 
-  test_reload_nginx
-
-  log "已创建反代：http://$domain -> 127.0.0.1:$port"
-  echo "配置文件：$file"
-  echo "启用链接：$enabled"
+  if test_reload_nginx; then
+    log "已创建反代：http://$domain -> 127.0.0.1:$port"
+    echo "配置文件：$file"
+    echo "启用链接：$enabled"
+  else
+    warn "反代文件已写入，但 Nginx 未能成功重载。请先修复上面提示的错误。"
+    echo "配置文件：$file"
+  fi
 }
 
 create_nginx_blank_template(){
@@ -684,8 +875,6 @@ cat > "$file" <<'EOF'
 # Nginx 空模板
 # 默认只保存在 sites-available，不自动启用。
 # 编辑完成后，可以在菜单里选择“启用站点”。
-#
-# 示例：
 #
 # server {
 #     listen 80;
@@ -801,7 +990,7 @@ select_nginx_any_site(){
   echo "站点配置："
   for i in "${!sites[@]}"; do
     enabled_mark=""
-    if [ -e "/etc/nginx/sites-enabled/${sites[$i]}" ]; then
+    if [ -e "/etc/nginx/sites-enabled/${sites[$i]}" ] || [ -L "/etc/nginx/sites-enabled/${sites[$i]}" ]; then
       enabled_mark=" [已启用]"
     fi
     echo "$((i+1))) ${sites[$i]}${enabled_mark}"
@@ -842,8 +1031,15 @@ enable_nginx_site(){
   rm -f "$enabled"
   ln -s "$file" "$enabled"
 
-  test_reload_nginx
-  log "已启用站点：$SELECTED_SITE"
+  if nginx_config_test_quiet; then
+    systemctl reload nginx 2>/dev/null || systemctl restart nginx
+    log "已启用站点：$SELECTED_SITE"
+  else
+    err "启用后 Nginx 检查失败，已自动撤销启用："
+    show_nginx_test_error
+    rm -f "$enabled"
+    nginx_config_test_quiet >/dev/null 2>&1 || true
+  fi
 }
 
 disable_nginx_site(){
@@ -916,13 +1112,18 @@ install_certbot(){
 certbot_issue(){
   command -v nginx >/dev/null 2>&1 || { err "请先安装 Nginx"; return 0; }
 
+  precheck_nginx_or_continue || return 0
+
   install_certbot
 
   read -rp "请输入申请证书的域名（回车取消）: " domain
   [ -z "$domain" ] && return 0
 
+  echo "说明：Certbot 会读取 Nginx 的 server_name，并自动写入 HTTPS 配置。"
+  echo "前提：域名已经解析到本机，公网 80 端口能访问。"
+
   certbot --nginx -d "$domain"
-  echo "建议测试续期：certbot renew --dry-run"
+  echo "建议测试续期：HTTPS 证书 -> 测试续期"
 }
 
 certbot_list(){
@@ -945,6 +1146,13 @@ certbot_test_renew(){
     return 0
   fi
 
+  echo "说明：这是模拟续期测试，不会真正更换证书。"
+  echo "看到 Congratulations 或 dry run successful 之类字样，就表示自动续期流程正常。"
+  echo "如果失败，通常是 Nginx 配置错误、域名解析错误、80端口不通。"
+  echo
+
+  precheck_nginx_or_continue || return 0
+
   certbot renew --dry-run
 }
 
@@ -954,8 +1162,10 @@ certbot_force_renew(){
     return 0
   fi
 
-  warn "强制续期一般不需要频繁执行"
+  warn "强制续期一般不需要频繁执行。普通检查请用“测试续期”。"
   ask_yn "确认强制续期？" "n" || return 0
+
+  precheck_nginx_or_continue || return 0
 
   certbot renew --force-renewal
 }
@@ -971,14 +1181,24 @@ certbot_delete(){
   read -rp "请输入要删除证书的域名/证书名（回车取消）: " name
   [ -z "$name" ] && return 0
 
-  warn "删除证书不会自动删除 Nginx 站点配置"
+  echo
+  warn "删除证书可能导致 Nginx 配置引用不存在的证书，从而 nginx -t 失败。"
+  echo "删除前建议先禁用或删除对应 Nginx 站点。"
+  echo
+  grep -R "/etc/letsencrypt/live/$name/" /etc/nginx/sites-available /etc/nginx/sites-enabled 2>/dev/null || true
+  echo
+
   ask_yn "确认删除该证书？" "n" || return 0
 
   certbot delete --cert-name "$name"
+
+  echo
+  warn "删除后正在检查 Nginx 是否还引用缺失证书..."
+  test_reload_nginx
 }
 
 # ----------------------------
-# Status / Commands
+# 状态 / 命令
 # ----------------------------
 
 show_status(){
@@ -1003,11 +1223,11 @@ show_status(){
   if command -v nginx >/dev/null 2>&1; then
     echo "版本：$(nginx -v 2>&1)"
     echo "服务：$(systemctl is-active nginx 2>/dev/null || echo 未知)"
-    if nginx -t >/tmp/nginx_check.log 2>&1; then
+    if nginx_config_test_quiet; then
       echo "配置：通过"
     else
       echo "配置：失败"
-      cat /tmp/nginx_check.log
+      show_nginx_test_error
     fi
     echo "启用站点："
     nginx_sites_enabled || true
@@ -1056,7 +1276,7 @@ EOF
 }
 
 # ----------------------------
-# Menus
+# 菜单
 # ----------------------------
 
 docker_menu(){
@@ -1109,7 +1329,8 @@ nginx_menu(){
     echo "6) 禁用站点"
     echo "7) 删除站点"
     echo "8) 检查重载"
-    echo "9) 卸载 Nginx"
+    echo "9) 修复证书引用"
+    echo "10) 卸载 Nginx"
     echo "0) 返回"
     echo
     read -rp "请选择: " c
@@ -1123,7 +1344,8 @@ nginx_menu(){
       6) disable_nginx_site; pause ;;
       7) delete_nginx_site; pause ;;
       8) test_reload_nginx; pause ;;
-      9) nginx_uninstall; pause ;;
+      9) repair_missing_cert_refs; pause ;;
+      10) nginx_uninstall; pause ;;
       0) return ;;
       "") continue ;;
       *) echo "无效选项"; sleep 1 ;;
