@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
-# Docker + Nginx + HTTPS 小白工具箱 v6
+# ============================================================
+# Docker + Nginx + HTTPS 小白工具箱 v7
 # 适合：Debian / Ubuntu
-# 特点：
-# - 主菜单精简，Docker/Nginx/HTTPS 分菜单
-# - 回车默认取消，避免误操作
-# - Docker/Nginx 选择项目逻辑修复
-# - HTTPS 增加证书管理：申请、查看、续期测试、强制续期、删除证书
-# - 默认 Docker 项目目录：/docker，并记住上次目录
-# - 不操作 UFW
+#
+# 修复重点：
+# - 取消/回车不再退出脚本
+# - Docker 项目选择、日志、更新、停止、重启逻辑修复
+# - Nginx 禁用/删除选择逻辑修复
+# - Nginx 删除会同时处理 sites-enabled 和 sites-available
+# - 已有配置只提供：覆盖 / 取消，不再生成备份文件
+# - 新增 Nginx 空模板
+# - HTTPS 证书独立管理
+#
+# 默认 Docker 项目目录：/docker
+# 配置记忆文件：/root/.docker-nginx-tool/config
+# ============================================================
 
-set -e
+# 交互脚本不使用 set -e，避免用户取消/回车时直接退出整个脚本
+set -o pipefail
 
 RED="\033[31m"
 GREEN="\033[32m"
@@ -17,11 +25,15 @@ YELLOW="\033[33m"
 BLUE="\033[34m"
 NC="\033[0m"
 
-VERSION="2026.05.01-v6"
+VERSION="2026.05.01-v7"
 CONF_DIR="/root/.docker-nginx-tool"
 CONF_FILE="$CONF_DIR/config"
 DEFAULT_BASE="/docker"
 LAST_BASE="$DEFAULT_BASE"
+
+OS_ID=""
+OS_CODENAME=""
+OS_NAME="未知系统"
 SELECTED_DIR=""
 SELECTED_SITE=""
 
@@ -32,14 +44,14 @@ err(){ echo -e "${RED}[错误]${NC} $1"; }
 
 need_root(){
   if [ "$(id -u)" -ne 0 ]; then
-    err "请使用 root 运行：sudo bash tool.sh"
+    err "请使用 root 运行，例如：sudo bash tool.sh"
     exit 1
   fi
 }
 
 detect_os(){
   if [ ! -f /etc/os-release ]; then
-    err "无法识别系统"
+    err "无法识别系统：找不到 /etc/os-release"
     exit 1
   fi
 
@@ -56,13 +68,18 @@ detect_os(){
 
 load_conf(){
   mkdir -p "$CONF_DIR"
-  [ -f "$CONF_FILE" ] && . "$CONF_FILE" || true
+  if [ -f "$CONF_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$CONF_FILE" 2>/dev/null || true
+  fi
   LAST_BASE="${LAST_BASE:-$DEFAULT_BASE}"
 }
 
 save_conf(){
   mkdir -p "$CONF_DIR"
-  echo "LAST_BASE=\"$LAST_BASE\"" > "$CONF_FILE"
+  cat > "$CONF_FILE" <<EOF
+LAST_BASE="$LAST_BASE"
+EOF
 }
 
 pause(){
@@ -100,25 +117,22 @@ valid_port(){
   echo "$1" | grep -Eq '^[0-9]+$' && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
 
-handle_file(){
+confirm_overwrite_file(){
   local file="$1"
 
-  if [ ! -f "$file" ]; then
+  if [ ! -e "$file" ]; then
     return 0
   fi
 
   warn "文件已存在：$file"
   echo "1) 直接覆盖"
-  echo "2) 备份后覆盖"
   echo "0) 取消"
   read -rp "请选择（默认 0 取消）: " c
   c="${c:-0}"
 
   case "$c" in
-    1) return 0 ;;
-    2)
-      cp "$file" "${file}.bak.$(date +%Y%m%d-%H%M%S)"
-      warn "已备份旧文件"
+    1)
+      rm -f "$file"
       return 0
       ;;
     *)
@@ -142,7 +156,7 @@ install_docker(){
     warn "Docker 和 Compose 插件已安装，跳过"
     docker --version
     docker compose version
-    return
+    return 0
   fi
 
   install_base_tools
@@ -197,7 +211,7 @@ install_nginx(){
 
   systemctl enable nginx
   systemctl start nginx
-  nginx -t
+  test_reload_nginx
 }
 
 install_all(){
@@ -206,20 +220,48 @@ install_all(){
   log "基础环境完成"
 }
 
+# ----------------------------
+# Docker / Compose
+# ----------------------------
+
 find_compose_files(){
-  find "$LAST_BASE" /docker /opt/docker-apps /app \
-    \( -name docker-compose.yml -o -name compose.yml \) 2>/dev/null | sort -u
+  local dirs=()
+  dirs+=("$LAST_BASE")
+  dirs+=("/docker")
+  dirs+=("/opt/docker-apps")
+  dirs+=("/app")
+
+  for d in "${dirs[@]}"; do
+    [ -d "$d" ] || continue
+    find "$d" \( -name docker-compose.yml -o -name compose.yml \) 2>/dev/null
+  done | sort -u
+}
+
+show_compose_projects(){
+  mapfile -t files < <(find_compose_files)
+
+  if [ "${#files[@]}" -eq 0 ]; then
+    warn "没有找到 Compose 项目"
+    echo "默认搜索目录：$LAST_BASE /docker /opt/docker-apps /app"
+    return 0
+  fi
+
+  echo "Compose 项目列表："
+  for i in "${!files[@]}"; do
+    echo "$((i+1))) $(dirname "${files[$i]}")"
+  done
 }
 
 select_compose_dir(){
   SELECTED_DIR=""
-
   mapfile -t files < <(find_compose_files)
 
   if [ "${#files[@]}" -eq 0 ]; then
-    warn "没有自动找到 compose 文件"
+    warn "没有自动找到 Compose 文件"
     read -rp "手动输入项目目录（回车取消）: " manual_dir
-    [ -z "$manual_dir" ] && return 1
+    if [ -z "$manual_dir" ]; then
+      return 1
+    fi
 
     if [ ! -f "$manual_dir/docker-compose.yml" ] && [ ! -f "$manual_dir/compose.yml" ]; then
       err "该目录没有 docker-compose.yml 或 compose.yml"
@@ -230,7 +272,7 @@ select_compose_dir(){
     return 0
   fi
 
-  echo "找到以下 Compose 项目："
+  echo "请选择 Compose 项目："
   for i in "${!files[@]}"; do
     echo "$((i+1))) $(dirname "${files[$i]}")"
   done
@@ -246,7 +288,9 @@ select_compose_dir(){
 
   if [ "$n" = "m" ] || [ "$n" = "M" ]; then
     read -rp "手动输入项目目录（回车取消）: " manual_dir
-    [ -z "$manual_dir" ] && return 1
+    if [ -z "$manual_dir" ]; then
+      return 1
+    fi
 
     if [ ! -f "$manual_dir/docker-compose.yml" ] && [ ! -f "$manual_dir/compose.yml" ]; then
       err "该目录没有 docker-compose.yml 或 compose.yml"
@@ -263,7 +307,6 @@ select_compose_dir(){
   fi
 
   idx=$((n-1))
-
   if [ "$idx" -lt 0 ] || [ "$idx" -ge "${#files[@]}" ]; then
     err "选择无效"
     return 1
@@ -282,7 +325,7 @@ create_docker_template(){
   while ! safe_name "$name"; do
     err "只能用英文、数字、横杠、下划线、点"
     read -rp "重新输入服务名（回车取消）: " name
-    [ -z "$name" ] && return
+    [ -z "$name" ] && return 0
   done
 
   read -rp "统一存放目录（默认 $LAST_BASE）: " base
@@ -295,7 +338,7 @@ create_docker_template(){
 
   mkdir -p "$dir"
 
-  handle_file "$file" || return
+  confirm_overwrite_file "$file" || return 0
 
   echo
   echo "模板类型："
@@ -309,7 +352,7 @@ create_docker_template(){
   case "$t" in
     0)
       warn "已取消"
-      return
+      return 0
       ;;
     2)
 cat > "$file" <<'EOF'
@@ -319,9 +362,13 @@ services:
     container_name: s-ui
     restart: unless-stopped
     ports:
+      # 面板端口：只允许本机访问，然后用 Nginx 反代
       - "127.0.0.1:2095:2095"
+
+      # 订阅端口：只允许本机访问，然后用 Nginx 反代或按需使用
       - "127.0.0.1:2096:2096"
-      # 如节点需要公网端口，可取消下一行注释
+
+      # 节点端口示例：如需要公网访问再打开
       # - "8443:8443"
     volumes:
       - ./db:/app/db
@@ -355,49 +402,73 @@ EOF
 
   log "已创建：$file"
   echo "编辑：nano $file"
-  echo "启动：cd $dir && docker compose up -d"
+  echo "应用配置/启动：cd $dir && docker compose up -d"
 }
 
-compose_start(){
-  select_compose_dir || return
-  cd "$SELECTED_DIR"
+compose_apply(){
+  select_compose_dir || return 0
+  cd "$SELECTED_DIR" || return 0
+
+  info "执行 docker compose up -d"
   docker compose up -d
-  log "已启动/重建：$SELECTED_DIR"
+  log "已启动/应用配置：$SELECTED_DIR"
 }
 
 compose_stop(){
-  select_compose_dir || return
-  cd "$SELECTED_DIR"
+  select_compose_dir || return 0
+  cd "$SELECTED_DIR" || return 0
+
   echo "将停止项目：$SELECTED_DIR"
-  ask_yn "确认停止？" "n" || return
+  ask_yn "确认停止？" "n" || return 0
+
   docker compose down
   log "已停止：$SELECTED_DIR"
 }
 
 compose_restart(){
-  select_compose_dir || return
-  cd "$SELECTED_DIR"
-  docker compose restart
-  log "已重启：$SELECTED_DIR"
+  select_compose_dir || return 0
+  cd "$SELECTED_DIR" || return 0
+
+  warn "docker compose restart 只重启容器，不会应用 docker-compose.yml 里的端口/挂载改动"
+  echo "1) 应用配置并重建（推荐，docker compose up -d）"
+  echo "2) 只重启容器（docker compose restart）"
+  echo "0) 取消"
+  read -rp "请选择（默认 1）: " c
+  c="${c:-1}"
+
+  case "$c" in
+    1)
+      docker compose up -d
+      log "已应用配置并重建：$SELECTED_DIR"
+      ;;
+    2)
+      docker compose restart
+      log "已重启容器：$SELECTED_DIR"
+      ;;
+    *)
+      warn "已取消"
+      ;;
+  esac
 }
 
 compose_logs(){
-  select_compose_dir || return
-  cd "$SELECTED_DIR"
+  select_compose_dir || return 0
+  cd "$SELECTED_DIR" || return 0
+
   echo "查看日志：$SELECTED_DIR"
   echo "按 Ctrl+C 退出日志"
   docker compose logs -f
 }
 
 update_one_service(){
-  info "更新某个 Compose 服务"
+  info "更新某个 Compose 项目"
 
-  select_compose_dir || return
+  select_compose_dir || return 0
 
   echo "即将更新：$SELECTED_DIR"
-  ask_yn "确认更新？" "y" || return
+  ask_yn "确认更新？" "y" || return 0
 
-  cd "$SELECTED_DIR"
+  cd "$SELECTED_DIR" || return 0
   docker compose pull
   docker compose up -d
 
@@ -413,8 +484,8 @@ update_all_services(){
   mapfile -t files < <(find_compose_files)
 
   if [ "${#files[@]}" -eq 0 ]; then
-    warn "没有找到 compose 文件"
-    return
+    warn "没有找到 Compose 文件"
+    return 0
   fi
 
   echo "将更新以下项目："
@@ -422,13 +493,13 @@ update_all_services(){
     echo "- $(dirname "$f")"
   done
 
-  ask_yn "确认全部更新？" "n" || return
+  ask_yn "确认全部更新？" "n" || return 0
 
   for f in "${files[@]}"; do
     dir="$(dirname "$f")"
     echo
     info "更新：$dir"
-    cd "$dir"
+    cd "$dir" || continue
     docker compose pull
     docker compose up -d
   done
@@ -451,12 +522,12 @@ docker_prune(){
       docker image prune -f
       ;;
     2)
-      ask_yn "确认执行 docker system prune？" "n" || return
+      ask_yn "确认执行 docker system prune？" "n" || return 0
       docker system prune -f
       ;;
     *)
       warn "已取消"
-      return
+      return 0
       ;;
   esac
 
@@ -473,12 +544,12 @@ docker_uninstall(){
 
   case "$c" in
     1)
-      ask_yn "确认卸载 Docker？" "n" || return
+      ask_yn "确认卸载 Docker？" "n" || return 0
       apt remove -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || true
       log "Docker 已卸载，项目目录未删除，/var/lib/docker 尽量保留"
       ;;
     2)
-      ask_yn "确认完全卸载 Docker？这会删除容器/镜像/卷数据" "n" || return
+      ask_yn "确认完全卸载 Docker？这会删除容器/镜像/卷数据" "n" || return 0
       apt remove -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || true
       rm -rf /var/lib/docker /var/lib/containerd
       log "Docker 已完全卸载，系统 Docker 数据已删除"
@@ -489,8 +560,40 @@ docker_uninstall(){
   esac
 }
 
+# ----------------------------
+# Nginx
+# ----------------------------
+
+nginx_sites_available(){
+  if [ -d /etc/nginx/sites-available ]; then
+    find /etc/nginx/sites-available -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort -u
+  fi
+}
+
+nginx_sites_enabled(){
+  if [ -d /etc/nginx/sites-enabled ]; then
+    find /etc/nginx/sites-enabled -maxdepth 1 \( -type f -o -type l \) -printf '%f\n' 2>/dev/null | sort -u
+  fi
+}
+
+nginx_sites_all(){
+  {
+    nginx_sites_available
+    nginx_sites_enabled
+  } | sort -u
+}
+
+test_reload_nginx(){
+  if nginx -t; then
+    systemctl reload nginx 2>/dev/null || systemctl restart nginx
+    log "Nginx 配置检查通过并已重载"
+  else
+    err "Nginx 配置检查失败，请检查配置文件"
+  fi
+}
+
 create_nginx_proxy(){
-  command -v nginx >/dev/null 2>&1 || { err "未安装 Nginx，请先安装"; return; }
+  command -v nginx >/dev/null 2>&1 || { err "未安装 Nginx，请先安装"; return 0; }
 
   read -rp "Nginx 配置名（默认 myapp）: " name
   name="${name:-myapp}"
@@ -498,24 +601,28 @@ create_nginx_proxy(){
   while ! safe_name "$name"; do
     err "只能用英文、数字、横杠、下划线、点"
     read -rp "重新输入配置名（回车取消）: " name
-    [ -z "$name" ] && return
+    [ -z "$name" ] && return 0
   done
 
   read -rp "域名（例 app.example.com，回车取消）: " domain
-  [ -z "$domain" ] && return
+  [ -z "$domain" ] && return 0
 
   read -rp "反代本机端口（例 2095，回车取消）: " port
-  [ -z "$port" ] && return
+  [ -z "$port" ] && return 0
 
   while ! valid_port "$port"; do
     err "端口必须是 1-65535"
     read -rp "重新输入端口（回车取消）: " port
-    [ -z "$port" ] && return
+    [ -z "$port" ] && return 0
   done
 
-  file="/etc/nginx/sites-available/$name"
+  mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
 
-  handle_file "$file" || return
+  file="/etc/nginx/sites-available/$name"
+  enabled="/etc/nginx/sites-enabled/$name"
+
+  confirm_overwrite_file "$file" || return 0
+  rm -f "$enabled"
 
 cat > "$file" <<EOF
 server {
@@ -542,31 +649,79 @@ server {
 }
 EOF
 
-  ln -sf "$file" "/etc/nginx/sites-enabled/$name"
+  ln -s "$file" "$enabled"
 
   if [ -e /etc/nginx/sites-enabled/default ]; then
     ask_yn "检测到默认站点 default，是否删除" "y" && rm -f /etc/nginx/sites-enabled/default
   fi
 
-  nginx -t
-  systemctl reload nginx
+  test_reload_nginx
 
   log "已创建反代：http://$domain -> 127.0.0.1:$port"
   echo "配置文件：$file"
+  echo "启用链接：$enabled"
+}
+
+create_nginx_blank_template(){
+  command -v nginx >/dev/null 2>&1 || { err "未安装 Nginx，请先安装"; return 0; }
+
+  read -rp "空模板名称（默认 blank，回车使用默认）: " name
+  name="${name:-blank}"
+
+  while ! safe_name "$name"; do
+    err "只能用英文、数字、横杠、下划线、点"
+    read -rp "重新输入名称（回车取消）: " name
+    [ -z "$name" ] && return 0
+  done
+
+  mkdir -p /etc/nginx/sites-available
+
+  file="/etc/nginx/sites-available/$name"
+
+  confirm_overwrite_file "$file" || return 0
+
+cat > "$file" <<'EOF'
+# Nginx 空模板
+# 默认只保存在 sites-available，不自动启用。
+# 编辑完成后，可以在菜单里选择“启用站点”。
+#
+# 示例：
+#
+# server {
+#     listen 80;
+#     server_name example.com;
+#
+#     location / {
+#         proxy_pass http://127.0.0.1:8080;
+#         proxy_http_version 1.1;
+#
+#         proxy_set_header Host $host;
+#         proxy_set_header X-Real-IP $remote_addr;
+#         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+#         proxy_set_header X-Forwarded-Proto $scheme;
+#
+#         proxy_set_header Upgrade $http_upgrade;
+#         proxy_set_header Connection "upgrade";
+#     }
+# }
+EOF
+
+  log "已创建空模板：$file"
+  echo "编辑：nano $file"
+  echo "启用：Nginx 管理 -> 启用站点"
 }
 
 list_nginx_sites(){
-  echo "已启用站点："
-  ls -l /etc/nginx/sites-enabled 2>/dev/null || true
+  echo "已启用站点（sites-enabled）："
+  nginx_sites_enabled || true
   echo
-  echo "可用配置："
-  ls -l /etc/nginx/sites-available 2>/dev/null || true
+  echo "可用配置（sites-available）："
+  nginx_sites_available || true
 }
 
-select_nginx_site(){
+select_nginx_enabled_site(){
   SELECTED_SITE=""
-
-  mapfile -t sites < <(ls /etc/nginx/sites-enabled 2>/dev/null || true)
+  mapfile -t sites < <(nginx_sites_enabled)
 
   if [ "${#sites[@]}" -eq 0 ]; then
     warn "没有启用的站点"
@@ -590,7 +745,6 @@ select_nginx_site(){
   fi
 
   idx=$((n-1))
-
   if [ "$idx" -lt 0 ] || [ "$idx" -ge "${#sites[@]}" ]; then
     err "选择无效"
     return 1
@@ -600,39 +754,122 @@ select_nginx_site(){
   return 0
 }
 
+select_nginx_available_site(){
+  SELECTED_SITE=""
+  mapfile -t sites < <(nginx_sites_available)
+
+  if [ "${#sites[@]}" -eq 0 ]; then
+    warn "没有可用配置"
+    return 1
+  fi
+
+  echo "可用配置："
+  for i in "${!sites[@]}"; do
+    echo "$((i+1))) ${sites[$i]}"
+  done
+  echo "0) 取消"
+
+  read -rp "请选择站点编号（默认 0 取消）: " n
+  n="${n:-0}"
+
+  [ "$n" = "0" ] && return 1
+
+  if ! echo "$n" | grep -Eq '^[0-9]+$'; then
+    err "选择无效"
+    return 1
+  fi
+
+  idx=$((n-1))
+  if [ "$idx" -lt 0 ] || [ "$idx" -ge "${#sites[@]}" ]; then
+    err "选择无效"
+    return 1
+  fi
+
+  SELECTED_SITE="${sites[$idx]}"
+  return 0
+}
+
+select_nginx_any_site(){
+  SELECTED_SITE=""
+  mapfile -t sites < <(nginx_sites_all)
+
+  if [ "${#sites[@]}" -eq 0 ]; then
+    warn "没有站点配置"
+    return 1
+  fi
+
+  echo "站点配置："
+  for i in "${!sites[@]}"; do
+    enabled_mark=""
+    if [ -e "/etc/nginx/sites-enabled/${sites[$i]}" ]; then
+      enabled_mark=" [已启用]"
+    fi
+    echo "$((i+1))) ${sites[$i]}${enabled_mark}"
+  done
+  echo "0) 取消"
+
+  read -rp "请选择站点编号（默认 0 取消）: " n
+  n="${n:-0}"
+
+  [ "$n" = "0" ] && return 1
+
+  if ! echo "$n" | grep -Eq '^[0-9]+$'; then
+    err "选择无效"
+    return 1
+  fi
+
+  idx=$((n-1))
+  if [ "$idx" -lt 0 ] || [ "$idx" -ge "${#sites[@]}" ]; then
+    err "选择无效"
+    return 1
+  fi
+
+  SELECTED_SITE="${sites[$idx]}"
+  return 0
+}
+
+enable_nginx_site(){
+  select_nginx_available_site || return 0
+
+  file="/etc/nginx/sites-available/$SELECTED_SITE"
+  enabled="/etc/nginx/sites-enabled/$SELECTED_SITE"
+
+  if [ ! -f "$file" ]; then
+    err "配置文件不存在：$file"
+    return 0
+  fi
+
+  rm -f "$enabled"
+  ln -s "$file" "$enabled"
+
+  test_reload_nginx
+  log "已启用站点：$SELECTED_SITE"
+}
+
 disable_nginx_site(){
-  select_nginx_site || return
+  select_nginx_enabled_site || return 0
 
   echo "将禁用站点：$SELECTED_SITE"
-  ask_yn "确认禁用？" "n" || return
+  ask_yn "确认禁用？" "n" || return 0
 
   rm -f "/etc/nginx/sites-enabled/$SELECTED_SITE"
-  nginx -t
-  systemctl reload nginx
 
+  test_reload_nginx
   log "已禁用：$SELECTED_SITE"
 }
 
 delete_nginx_site(){
-  select_nginx_site || return
+  select_nginx_any_site || return 0
 
-  echo "将删除站点配置：$SELECTED_SITE"
+  echo "将删除站点：$SELECTED_SITE"
   warn "会删除 sites-enabled 链接和 sites-available 配置文件"
-  ask_yn "确认删除？" "n" || return
+  ask_yn "确认删除？" "n" || return 0
 
   rm -f "/etc/nginx/sites-enabled/$SELECTED_SITE"
   rm -f "/etc/nginx/sites-available/$SELECTED_SITE"
 
-  nginx -t
-  systemctl reload nginx
-
+  test_reload_nginx
   log "已删除：$SELECTED_SITE"
-}
-
-nginx_test_reload(){
-  nginx -t
-  systemctl reload nginx
-  log "Nginx 配置检查通过并已重载"
 }
 
 nginx_uninstall(){
@@ -645,12 +882,12 @@ nginx_uninstall(){
 
   case "$c" in
     1)
-      ask_yn "确认卸载 Nginx？" "n" || return
+      ask_yn "确认卸载 Nginx？" "n" || return 0
       apt remove -y nginx nginx-common nginx-core || true
       log "Nginx 已卸载，配置尽量保留"
       ;;
     2)
-      ask_yn "确认完全卸载 Nginx？这会删除 /etc/nginx" "n" || return
+      ask_yn "确认完全卸载 Nginx？这会删除 /etc/nginx" "n" || return 0
       apt purge -y nginx nginx-common nginx-core || true
       rm -rf /etc/nginx
       log "Nginx 已完全卸载，配置已删除"
@@ -661,10 +898,15 @@ nginx_uninstall(){
   esac
 }
 
+# ----------------------------
+# HTTPS / Certbot
+# ----------------------------
+
 install_certbot(){
   if ! command -v certbot >/dev/null 2>&1; then
     apt update
     apt install -y certbot python3-certbot-nginx
+    log "Certbot 已安装"
   else
     warn "Certbot 已安装"
     certbot --version || true
@@ -672,12 +914,12 @@ install_certbot(){
 }
 
 certbot_issue(){
-  command -v nginx >/dev/null 2>&1 || { err "请先安装 Nginx"; return; }
+  command -v nginx >/dev/null 2>&1 || { err "请先安装 Nginx"; return 0; }
 
   install_certbot
 
   read -rp "请输入申请证书的域名（回车取消）: " domain
-  [ -z "$domain" ] && return
+  [ -z "$domain" ] && return 0
 
   certbot --nginx -d "$domain"
   echo "建议测试续期：certbot renew --dry-run"
@@ -686,7 +928,7 @@ certbot_issue(){
 certbot_list(){
   if ! command -v certbot >/dev/null 2>&1; then
     warn "Certbot 未安装"
-    return
+    return 0
   fi
 
   certbot certificates
@@ -700,7 +942,7 @@ certbot_list(){
 certbot_test_renew(){
   if ! command -v certbot >/dev/null 2>&1; then
     warn "Certbot 未安装"
-    return
+    return 0
   fi
 
   certbot renew --dry-run
@@ -709,36 +951,41 @@ certbot_test_renew(){
 certbot_force_renew(){
   if ! command -v certbot >/dev/null 2>&1; then
     warn "Certbot 未安装"
-    return
+    return 0
   fi
 
-  warn "强制续期一般不需要频繁执行，普通情况用测试续期即可"
-  ask_yn "确认强制续期？" "n" || return
+  warn "强制续期一般不需要频繁执行"
+  ask_yn "确认强制续期？" "n" || return 0
+
   certbot renew --force-renewal
 }
 
 certbot_delete(){
   if ! command -v certbot >/dev/null 2>&1; then
     warn "Certbot 未安装"
-    return
+    return 0
   fi
 
   certbot certificates
   echo
   read -rp "请输入要删除证书的域名/证书名（回车取消）: " name
-  [ -z "$name" ] && return
+  [ -z "$name" ] && return 0
 
   warn "删除证书不会自动删除 Nginx 站点配置"
-  ask_yn "确认删除该证书？" "n" || return
+  ask_yn "确认删除该证书？" "n" || return 0
 
   certbot delete --cert-name "$name"
 }
+
+# ----------------------------
+# Status / Commands
+# ----------------------------
 
 show_status(){
   echo "============================================================"
   echo "当前状态"
   echo "============================================================"
-  echo "系统：$(. /etc/os-release && echo "$PRETTY_NAME")"
+  echo "系统：$OS_NAME"
   echo
 
   echo "【Docker】"
@@ -762,8 +1009,8 @@ show_status(){
       echo "配置：失败"
       cat /tmp/nginx_check.log
     fi
-    echo "站点："
-    ls -l /etc/nginx/sites-enabled 2>/dev/null || true
+    echo "启用站点："
+    nginx_sites_enabled || true
   else
     echo "未安装"
   fi
@@ -790,10 +1037,11 @@ Docker:
 
 Compose:
   cd 项目目录
-  docker compose pull
-  docker compose up -d
-  docker compose logs -f
-  docker compose down
+  docker compose up -d          # 启动/应用 docker-compose.yml 改动
+  docker compose restart        # 只重启容器，不应用端口/挂载改动
+  docker compose pull           # 拉取新镜像
+  docker compose logs -f        # 查看日志
+  docker compose down           # 停止并删除容器，不删挂载数据
 
 Nginx:
   nginx -t
@@ -807,36 +1055,43 @@ HTTPS:
 EOF
 }
 
+# ----------------------------
+# Menus
+# ----------------------------
+
 docker_menu(){
   while true; do
     clear
     echo "========== Docker 管理 =========="
     echo "1) 安装/检测"
-    echo "2) 创建模板"
-    echo "3) 启动项目"
-    echo "4) 停止项目"
-    echo "5) 重启项目"
-    echo "6) 查看日志"
-    echo "7) 更新一个"
-    echo "8) 更新全部"
-    echo "9) 清理空间"
-    echo "10) 卸载 Docker"
+    echo "2) 查看项目"
+    echo "3) 创建模板"
+    echo "4) 启动/应用配置"
+    echo "5) 停止项目"
+    echo "6) 重启项目"
+    echo "7) 查看日志"
+    echo "8) 更新一个"
+    echo "9) 更新全部"
+    echo "10) 清理空间"
+    echo "11) 卸载 Docker"
     echo "0) 返回"
     echo
     read -rp "请选择: " c
 
     case "$c" in
       1) install_docker; pause ;;
-      2) create_docker_template; pause ;;
-      3) compose_start; pause ;;
-      4) compose_stop; pause ;;
-      5) compose_restart; pause ;;
-      6) compose_logs; pause ;;
-      7) update_one_service; pause ;;
-      8) update_all_services; pause ;;
-      9) docker_prune; pause ;;
-      10) docker_uninstall; pause ;;
-      0|"") return ;;
+      2) show_compose_projects; pause ;;
+      3) create_docker_template; pause ;;
+      4) compose_apply; pause ;;
+      5) compose_stop; pause ;;
+      6) compose_restart; pause ;;
+      7) compose_logs; pause ;;
+      8) update_one_service; pause ;;
+      9) update_all_services; pause ;;
+      10) docker_prune; pause ;;
+      11) docker_uninstall; pause ;;
+      0) return ;;
+      "") continue ;;
       *) echo "无效选项"; sleep 1 ;;
     esac
   done
@@ -848,11 +1103,13 @@ nginx_menu(){
     echo "========== Nginx 管理 =========="
     echo "1) 安装/检测"
     echo "2) 创建反代"
-    echo "3) 查看站点"
-    echo "4) 禁用站点"
-    echo "5) 删除站点"
-    echo "6) 检查重载"
-    echo "7) 卸载 Nginx"
+    echo "3) 创建空模板"
+    echo "4) 查看站点"
+    echo "5) 启用站点"
+    echo "6) 禁用站点"
+    echo "7) 删除站点"
+    echo "8) 检查重载"
+    echo "9) 卸载 Nginx"
     echo "0) 返回"
     echo
     read -rp "请选择: " c
@@ -860,12 +1117,15 @@ nginx_menu(){
     case "$c" in
       1) install_nginx; pause ;;
       2) create_nginx_proxy; pause ;;
-      3) list_nginx_sites; pause ;;
-      4) disable_nginx_site; pause ;;
-      5) delete_nginx_site; pause ;;
-      6) nginx_test_reload; pause ;;
-      7) nginx_uninstall; pause ;;
-      0|"") return ;;
+      3) create_nginx_blank_template; pause ;;
+      4) list_nginx_sites; pause ;;
+      5) enable_nginx_site; pause ;;
+      6) disable_nginx_site; pause ;;
+      7) delete_nginx_site; pause ;;
+      8) test_reload_nginx; pause ;;
+      9) nginx_uninstall; pause ;;
+      0) return ;;
+      "") continue ;;
       *) echo "无效选项"; sleep 1 ;;
     esac
   done
@@ -892,7 +1152,8 @@ https_menu(){
       4) certbot_test_renew; pause ;;
       5) certbot_force_renew; pause ;;
       6) certbot_delete; pause ;;
-      0|"") return ;;
+      0) return ;;
+      "") continue ;;
       *) echo "无效选项"; sleep 1 ;;
     esac
   done
@@ -922,7 +1183,8 @@ main_menu(){
       4) https_menu ;;
       5) show_status; pause ;;
       6) show_commands; pause ;;
-      0|"") exit 0 ;;
+      0) exit 0 ;;
+      "") continue ;;
       *) echo "无效选项"; sleep 1 ;;
     esac
   done
