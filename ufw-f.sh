@@ -372,38 +372,145 @@ recommended_install() {
     ok "推荐安装完成。"
 }
 
+
 # ==================================================
-# UFW管理
+# UFW规则极简显示/删除
 # ==================================================
 
-ufw_status_rules() {
-    title "防火墙状态 / 规则"
-
+ufw_rule_compact_list() {
     if ! command -v ufw >/dev/null 2>&1; then
         bad "UFW未安装"
         return
     fi
 
+    title "防火墙状态/开放端口"
+
     v="$(ufw status verbose 2>/dev/null || true)"
-
-    if echo "$v" | grep -qi "Status: active"; then
-        ok "状态：已启用"
-    else
-        bad "状态：未启用"
-    fi
-
-    if echo "$v" | grep -qi "Default: deny (incoming)"; then
-        ok "默认入站：拒绝"
-    else
-        warn "默认入站：不是拒绝"
-    fi
+    echo "$v" | grep -qi "Status: active" && ok "状态：已启用" || bad "状态：未启用"
+    echo "$v" | grep -qi "Default: deny (incoming)" && ok "入站：默认拒绝" || warn "入站：不是默认拒绝"
 
     echo
-    echo "规则说明：ALLOW IN=放行，DENY IN=拒绝，(v6)=IPv6"
+    echo "开放端口："
+
+    tmp="$(mktemp)"
+    ufw status 2>/dev/null | awk 'NR>4 && $0 !~ /^--/ && /ALLOW/ {print $1}' > "$tmp"
+
+    if [ ! -s "$tmp" ]; then
+        echo "- 暂无开放端口"
+        rm -f "$tmp"
+        return
+    fi
+
+    awk '
+    {
+        raw=$0
+        v6 = raw ~ /\(v6\)/
+        gsub(/\(v6\)/,"",raw)
+        gsub(/\/tcp/,"",raw)
+        gsub(/\/udp/,"",raw)
+        gsub(/[[:space:]]/,"",raw)
+        if (raw=="") next
+        if (v6) ipv6[raw]=1; else ipv4[raw]=1
+        ports[raw]=1
+    }
+    END {
+        for (p in ports) {
+            tag=""
+            if (ipv4[p] && ipv6[p]) tag="IPv4+IPv6"
+            else if (ipv4[p]) tag="IPv4"
+            else if (ipv6[p]) tag="IPv6"
+            print p "|" tag
+        }
+    }' "$tmp" | sort -n | while IFS="|" read -r port tag; do
+        echo "- ${port}（${tag}，$(port_name "$port")）"
+    done
+
+    rm -f "$tmp"
+
     echo
+    echo "原生规则："
     ufw status numbered
 }
 
+ufw_delete_by_port() {
+    title "删除端口规则"
+    echo "1. 删除 IPv4 + IPv6"
+    echo "2. 只删 IPv4"
+    echo "3. 只删 IPv6"
+    echo "4. 按编号删除"
+    echo
+
+    ufw_rule_compact_list
+    echo
+
+    read -rp "选择模式，默认1：" mode
+    mode="${mode:-1}"
+
+    case "$mode" in
+        1|2|3)
+            read -rp "输入端口，多个用空格：" ports
+            [ -z "$ports" ] && warn "未输入端口。" && return
+
+            for p in $ports; do
+                clean="$(echo "$p" | sed 's#/.*##')"
+
+                case "$mode" in
+                    1)
+                        deleted=0
+                        ufw delete allow "$p" >/dev/null 2>&1 && deleted=1
+                        ufw delete allow "$p/tcp" >/dev/null 2>&1 && deleted=1 || true
+                        ufw delete allow "$p/udp" >/dev/null 2>&1 && deleted=1 || true
+                        [ "$deleted" = 1 ] && ok "已删除 ${p} 的放行规则" || warn "未找到 ${p} 的放行规则"
+                        ;;
+                    2)
+                        mapfile -t nums < <(ufw status numbered | awk -v p="$clean" '
+                            $0 ~ "^\\[" && $0 !~ "\\(v6\\)" && $0 ~ ("[[:space:]]" p "(/tcp|/udp)?[[:space:]]") && $0 ~ "ALLOW" {
+                                gsub("\\[","",$1); gsub("\\]","",$1); print $1
+                            }' | sort -nr)
+                        if [ "${#nums[@]}" -eq 0 ]; then
+                            warn "未找到 ${p} 的 IPv4 放行规则"
+                        else
+                            for n in "${nums[@]}"; do ufw --force delete "$n"; done
+                            ok "已删除 ${p} 的 IPv4 放行规则"
+                        fi
+                        ;;
+                    3)
+                        mapfile -t nums < <(ufw status numbered | awk -v p="$clean" '
+                            $0 ~ "^\\[" && $0 ~ "\\(v6\\)" && $0 ~ ("[[:space:]]" p "(/tcp|/udp)?[[:space:]]") && $0 ~ "ALLOW" {
+                                gsub("\\[","",$1); gsub("\\]","",$1); print $1
+                            }' | sort -nr)
+                        if [ "${#nums[@]}" -eq 0 ]; then
+                            warn "未找到 ${p} 的 IPv6 放行规则"
+                        else
+                            for n in "${nums[@]}"; do ufw --force delete "$n"; done
+                            ok "已删除 ${p} 的 IPv6 放行规则"
+                        fi
+                        ;;
+                esac
+            done
+            ;;
+        4)
+            ufw status numbered
+            echo
+            read -rp "输入编号，多个用空格，会自动倒序删除：" nums
+            [ -z "$nums" ] && warn "未输入编号。" && return
+            for n in $(echo "$nums" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -nr); do
+                ufw --force delete "$n"
+            done
+            ;;
+        *)
+            warn "无效模式。"
+            ;;
+    esac
+}
+
+# ==================================================
+# UFW管理
+# ==================================================
+
+ufw_status_rules() {
+    ufw_rule_compact_list
+}
 ufw_allow_ports() {
     title "放行端口"
     echo "可输入多个端口，例如：80 443 8443"
@@ -442,19 +549,8 @@ ufw_deny_ports() {
 }
 
 ufw_delete_rule() {
-    title "删除规则"
-    echo "输入最左边[]里的编号。IPv4和IPv6规则通常要分别删除。"
-    echo
-
-    ufw status numbered
-    echo
-
-    read -rp "编号：" num
-    [ -z "$num" ] && warn "未输入编号。" && return
-
-    ufw delete "$num"
+    ufw_delete_by_port
 }
-
 ufw_action_menu() {
     title "防火墙操作"
     echo "1. 启用"
@@ -480,10 +576,10 @@ ufw_menu() {
     while true; do
         clear
         echo "===== 防火墙管理 ====="
-        echo "1. 状态/规则"
+        echo "1. 状态/开放端口"
         echo "2. 放行端口"
         echo "3. 拒绝端口"
-        echo "4. 删除规则"
+        echo "4. 删除端口规则"
         echo "5. 启用/禁用/重载/重置"
         echo "0. 返回"
         echo
