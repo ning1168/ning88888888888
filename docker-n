@@ -3,19 +3,13 @@
 # Docker + Docker Compose Plugin + Nginx 小白菜单工具箱
 # 适合系统：Debian / Ubuntu
 #
-# 主要功能：
-# 1. 安装 / 检测 Docker
-# 2. 安装 / 检测 Docker Compose 插件
-# 3. 安装 / 检测 Nginx
-# 4. 创建 Docker 服务模板
-# 5. 创建 Nginx 反向代理配置
-# 6. 安装 Certbot 并申请 HTTPS 证书
-# 7. 查看常用状态
+# 设计目标：
+# - 方便：菜单式操作，想做什么选什么
+# - 安全：重复配置会提示，确认后自动备份旧文件再覆盖
+# - 小白友好：中文提示、默认值、路径提示、命令提示
+# - 不操作 UFW：防火墙交给用户自己或云厂商安全组处理
 #
-# 注意：
-# - 本脚本已取消 UFW 防火墙操作
-# - 不会自动删除你的 Docker 数据目录
-# - 创建配置前会尽量避免重复覆盖
+# 版本：2026.05.01-v2
 # ============================================================
 
 set -e
@@ -27,20 +21,20 @@ BLUE="\033[34m"
 CYAN="\033[36m"
 NC="\033[0m"
 
-log() { echo -e "${GREEN}[成功]${NC} $1"; }
-info() { echo -e "${BLUE}[提示]${NC} $1"; }
-warn() { echo -e "${YELLOW}[注意]${NC} $1"; }
-err() { echo -e "${RED}[错误]${NC} $1"; }
-
-SCRIPT_VERSION="2026.05.01-menu"
+SCRIPT_VERSION="2026.05.01-v2"
 
 OS_ID=""
 OS_CODENAME=""
 OS_PRETTY=""
 
+log() { echo -e "${GREEN}[成功]${NC} $1"; }
+info() { echo -e "${BLUE}[提示]${NC} $1"; }
+warn() { echo -e "${YELLOW}[注意]${NC} $1"; }
+err() { echo -e "${RED}[错误]${NC} $1"; }
+
 need_root() {
   if [ "$(id -u)" -ne 0 ]; then
-    err "请使用 root 用户运行，例如：sudo bash install.sh"
+    err "请使用 root 用户运行，例如：sudo bash script.sh"
     exit 1
   fi
 }
@@ -87,11 +81,19 @@ ask_yes_no() {
     fi
 
     case "$answer" in
-      y|Y|yes|YES) return 0 ;;
-      n|N|no|NO) return 1 ;;
-      *) echo "请输入 y 或 n" ;;
+      y|Y|yes|YES|Yes) return 0 ;;
+      n|N|no|NO|No) return 1 ;;
+      *) echo "请输入 y 或 n，也可以输入 yes 或 no，不区分大小写" ;;
     esac
   done
+}
+
+read_default() {
+  local prompt="$1"
+  local default="$2"
+  local value
+  read -rp "$prompt（默认：$default）: " value
+  echo "${value:-$default}"
 }
 
 safe_name() {
@@ -115,19 +117,27 @@ backup_file_if_exists() {
   if [ -f "$file" ]; then
     local bak="${file}.bak.$(date +%Y%m%d-%H%M%S)"
     cp "$file" "$bak"
-    warn "检测到原文件已存在，已备份为：$bak"
+    warn "旧文件已备份为：$bak"
   fi
 }
 
 install_base_tools() {
-  info "安装基础工具：curl wget ca-certificates gnupg lsb-release nano vim git..."
+  info "检查/安装基础工具：curl wget ca-certificates gnupg lsb-release nano vim git..."
   apt update
   apt install -y ca-certificates curl wget gnupg lsb-release nano vim git
-  log "基础工具安装完成"
+  log "基础工具已就绪"
 }
 
 install_docker() {
   detect_os
+
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    warn "Docker 和 Docker Compose 插件都已经安装，跳过安装"
+    docker --version || true
+    docker compose version || true
+    return
+  fi
+
   install_base_tools
 
   if command -v docker >/dev/null 2>&1; then
@@ -167,12 +177,8 @@ EOF
     docker --version
   fi
 
-  install_compose_plugin
-}
-
-install_compose_plugin() {
   if docker compose version >/dev/null 2>&1; then
-    warn "检测到 Docker Compose 插件已经可用，跳过安装"
+    warn "Docker Compose 插件已经可用"
     docker compose version
   else
     info "安装 Docker Compose 插件..."
@@ -184,12 +190,11 @@ install_compose_plugin() {
 }
 
 install_nginx() {
-  install_base_tools
-
   if command -v nginx >/dev/null 2>&1; then
     warn "检测到 Nginx 已经安装，跳过安装"
     nginx -v || true
   else
+    install_base_tools
     info "安装 Nginx..."
     apt update
     apt install -y nginx
@@ -206,114 +211,146 @@ install_nginx() {
 install_all_base() {
   install_docker
   install_nginx
-  info "基础环境安装完成：Docker + Compose 插件 + Nginx"
+  log "基础环境已完成：Docker + Compose 插件 + Nginx"
+}
+
+choose_compose_template() {
+  echo
+  echo "请选择 Docker Compose 模板类型："
+  echo "  1) 通用空模板：适合任何项目，后续自己改 image / ports / volumes"
+  echo "  2) S-UI 示例模板：预填 S-UI 常用配置，后续可自己改"
+  echo "  3) 纯空白文件：只创建目录和 docker-compose.yml，内容最少"
+  echo
+  read -rp "请选择模板编号（默认 1）: " tpl
+  tpl="${tpl:-1}"
+  echo "$tpl"
 }
 
 create_docker_template() {
-  if ! command -v docker >/dev/null 2>&1; then
-    warn "未检测到 Docker。建议先执行菜单 1 安装基础环境。"
-    if ! ask_yes_no "是否仍然继续创建模板？" "n"; then
-      return
-    fi
-  fi
-
   echo
-  info "创建 Docker 服务模板"
+  info "创建 Docker 服务目录和 docker-compose.yml"
   echo "说明："
-  echo "  服务名称可以自定义，例如：s-ui、komari、oci-helper、myapp"
-  echo "  服务名称建议使用英文、数字、横杠，不要用中文或空格"
+  echo "  这里主要帮你创建文件夹和模板文件。"
+  echo "  不强行安装具体项目，因为每个项目官方配置都可能不一样。"
+  echo "  你后续进入 docker-compose.yml 修改内容即可。"
   echo
 
-  read -rp "请输入服务名称: " SERVICE_NAME
+  local default_service="myapp"
+  read -rp "请输入服务名称/文件夹名称（默认：${default_service}，例：sui、komari、oci-helper）: " SERVICE_NAME
+  SERVICE_NAME="${SERVICE_NAME:-$default_service}"
+
   while ! safe_name "$SERVICE_NAME"; do
     err "服务名称只能包含英文、数字、点、横杠、下划线，不能有中文或空格"
     read -rp "请重新输入服务名称: " SERVICE_NAME
   done
 
-  read -rp "请输入服务统一存放目录（默认 /opt/docker-apps）: " BASE_DIR
-  BASE_DIR="${BASE_DIR:-/opt/docker-apps}"
+  local default_base="/opt/docker-apps"
+  read -rp "请输入服务统一存放目录（默认：${default_base}）: " BASE_DIR
+  BASE_DIR="${BASE_DIR:-$default_base}"
 
   APP_DIR="${BASE_DIR}/${SERVICE_NAME}"
   COMPOSE_FILE="${APP_DIR}/docker-compose.yml"
 
   if [ -f "$COMPOSE_FILE" ]; then
-    warn "已存在：$COMPOSE_FILE"
-    if ! ask_yes_no "是否覆盖？覆盖前会自动备份" "n"; then
+    warn "检测到 Docker Compose 文件已存在：$COMPOSE_FILE"
+    if ask_yes_no "是否覆盖？选择 Y 会先备份旧文件，再写入新模板" "n"; then
+      backup_file_if_exists "$COMPOSE_FILE"
+    else
       warn "已取消创建 Docker 模板"
       return
     fi
-    backup_file_if_exists "$COMPOSE_FILE"
-  fi
-
-  echo
-  read -rp "请输入镜像名（例：nginx:latest，可先留空后面改）: " IMAGE_NAME
-  IMAGE_NAME="${IMAGE_NAME:-请改成你的镜像名:latest}"
-
-  read -rp "请输入容器内部端口（例：8080，不知道就填项目文档里的端口）: " CONTAINER_PORT
-  while ! valid_port "$CONTAINER_PORT"; do
-    err "端口必须是 1-65535 的数字"
-    read -rp "请重新输入容器内部端口: " CONTAINER_PORT
-  done
-
-  read -rp "请输入服务器本机端口（默认同容器端口 ${CONTAINER_PORT}）: " HOST_PORT
-  HOST_PORT="${HOST_PORT:-$CONTAINER_PORT}"
-  while ! valid_port "$HOST_PORT"; do
-    err "端口必须是 1-65535 的数字"
-    read -rp "请重新输入服务器本机端口: " HOST_PORT
-  done
-
-  if ask_yes_no "这个端口是否只允许本机访问？面板类服务建议选 Y" "y"; then
-    PORT_LINE="127.0.0.1:${HOST_PORT}:${CONTAINER_PORT}"
-  else
-    PORT_LINE="${HOST_PORT}:${CONTAINER_PORT}"
   fi
 
   mkdir -p "$APP_DIR"
 
-  cat > "$COMPOSE_FILE" <<EOF
+  tpl="$(choose_compose_template)"
+
+  case "$tpl" in
+    2)
+      cat > "$COMPOSE_FILE" <<'EOF'
+services:
+  s-ui:
+    image: alireza7/s-ui:latest
+    container_name: s-ui
+    restart: unless-stopped
+    ports:
+      # 面板端口：只允许本机访问，然后用 Nginx 反代
+      - "127.0.0.1:2095:2095"
+
+      # 订阅端口：只允许本机访问，然后用 Nginx 反代或按需使用
+      - "127.0.0.1:2096:2096"
+
+      # 节点端口示例：如需要公网访问再打开
+      # - "8443:8443"
+    volumes:
+      # 数据目录：不要随便删除
+      - ./db:/app/db
+
+      # 证书目录：不要随便删除
+      - ./cert:/app/cert
+EOF
+      ;;
+    3)
+      cat > "$COMPOSE_FILE" <<'EOF'
+services:
+  app:
+    image: 请改成你的镜像名:latest
+    container_name: 请改成你的容器名
+    restart: unless-stopped
+EOF
+      ;;
+    *)
+      cat > "$COMPOSE_FILE" <<EOF
 services:
   ${SERVICE_NAME}:
-    image: ${IMAGE_NAME}
+    image: 请改成你的镜像名:latest
     container_name: ${SERVICE_NAME}
     restart: unless-stopped
     ports:
-      # 格式说明：
-      # "127.0.0.1:宿主机端口:容器端口" = 只允许服务器本机访问，推荐给面板类服务
-      # "宿主机端口:容器端口" = 暴露公网，适合节点端口或必须公网访问的端口
-      - "${PORT_LINE}"
+      # 通用端口写法：
+      # "127.0.0.1:宿主机端口:容器端口" = 只允许本机访问，适合面板/后台服务
+      # "宿主机端口:容器端口" = 暴露公网，适合必须公网访问的节点端口
+      #
+      # 示例：把容器 8080 端口映射到服务器本机 8080，只允许本机访问
+      - "127.0.0.1:8080:8080"
     volumes:
-      # 左边 ./data 是服务器目录，右边 /app/data 是容器内部目录
-      # 具体容器内部目录要看项目官方文档
+      # 通用数据目录示例：
+      # 左边 ./data 是服务器当前文件夹下的 data
+      # 右边 /app/data 是容器内部目录，具体要看项目官方文档
       - ./data:/app/data
 EOF
+      ;;
+  esac
 
-  log "已生成 Docker Compose 模板：$COMPOSE_FILE"
+  log "已生成：$COMPOSE_FILE"
   echo
-  warn "下一步你通常需要编辑这个文件，把 image、ports、volumes 改成项目官方要求。"
-  echo "编辑命令："
-  echo "  nano $COMPOSE_FILE"
+  echo "下一步常用命令："
+  echo "  编辑配置：nano $COMPOSE_FILE"
+  echo "  进入目录：cd $APP_DIR"
+  echo "  启动服务：docker compose up -d"
+  echo "  查看日志：docker compose logs -f"
   echo
-  echo "启动命令："
-  echo "  cd $APP_DIR && docker compose up -d"
+  warn "注意：模板不一定能直接启动，通常需要先按项目官方文档修改 image、ports、volumes。"
 }
 
 create_nginx_proxy() {
   if ! command -v nginx >/dev/null 2>&1; then
-    warn "未检测到 Nginx。建议先执行菜单 1 安装基础环境。"
+    warn "未检测到 Nginx。建议先执行菜单 1 或 3 安装 Nginx。"
     if ! ask_yes_no "是否仍然继续创建 Nginx 配置？" "n"; then
       return
     fi
   fi
 
   echo
-  info "创建 Nginx 反向代理配置"
+  info "创建 Nginx 通用反向代理配置"
   echo "说明："
-  echo "  配置名称只是文件名，可以自定义，例如：s-ui、komari、oci-helper"
-  echo "  域名必须已经解析到这台服务器"
-  echo "  反代端口一般是 Docker 中 127.0.0.1:端口:容器端口 的那个宿主机端口"
+  echo "  这是通用模板：一个域名 -> 一个本机端口。"
+  echo "  适合大多数面板、监控、后台服务。"
+  echo "  如果项目有 /myvnc/、/ws/、/api/ 等特殊 location，生成后再手动修改。"
   echo
 
-  read -rp "请输入 Nginx 配置名称: " SITE_NAME
+  read -rp "请输入 Nginx 配置名称/文件名（默认：myapp，例：sui、komari、oci-helper）: " SITE_NAME
+  SITE_NAME="${SITE_NAME:-myapp}"
   while ! safe_name "$SITE_NAME"; do
     err "配置名称只能包含英文、数字、点、横杠、下划线，不能有中文或空格"
     read -rp "请重新输入配置名称: " SITE_NAME
@@ -332,14 +369,16 @@ create_nginx_proxy() {
   done
 
   SITE_FILE="/etc/nginx/sites-available/${SITE_NAME}"
+  ENABLED_FILE="/etc/nginx/sites-enabled/${SITE_NAME}"
 
   if [ -f "$SITE_FILE" ]; then
-    warn "Nginx 配置已存在：$SITE_FILE"
-    if ! ask_yes_no "是否覆盖？覆盖前会自动备份" "n"; then
+    warn "检测到 Nginx 配置已存在：$SITE_FILE"
+    if ask_yes_no "是否覆盖？选择 Y 会先备份旧文件，再写入新配置" "n"; then
+      backup_file_if_exists "$SITE_FILE"
+    else
       warn "已取消创建 Nginx 配置"
       return
     fi
-    backup_file_if_exists "$SITE_FILE"
   fi
 
   cat > "$SITE_FILE" <<EOF
@@ -357,10 +396,11 @@ server {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
 
-        # WebSocket 支持，很多面板、监控、VNC、终端服务都需要
+        # WebSocket 支持：很多面板、监控、VNC、终端服务都需要
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
 
+        # 长连接超时：适合面板、WebSocket、远程终端类服务
         send_timeout 10800;
         proxy_read_timeout 10800;
         proxy_send_timeout 10800;
@@ -368,7 +408,7 @@ server {
 }
 EOF
 
-  ln -sf "$SITE_FILE" "/etc/nginx/sites-enabled/${SITE_NAME}"
+  ln -sf "$SITE_FILE" "$ENABLED_FILE"
 
   if [ -e /etc/nginx/sites-enabled/default ]; then
     if ask_yes_no "检测到默认欢迎页配置 default，是否删除？新服务器建议删除" "y"; then
@@ -380,8 +420,19 @@ EOF
   nginx -t
   systemctl reload nginx
 
-  log "Nginx 反向代理已创建：${DOMAIN} -> 127.0.0.1:${TARGET_PORT}"
-  warn "如果访问仍是 Nginx 欢迎页，检查 DNS 是否解析到本机 IP，以及 server_name 是否写对"
+  log "Nginx 反向代理已创建并启用"
+  echo
+  echo "配置文件：$SITE_FILE"
+  echo "启用链接：$ENABLED_FILE"
+  echo "访问地址：http://${DOMAIN}"
+  echo "反代目标：http://127.0.0.1:${TARGET_PORT}"
+  echo
+  echo "后续常用命令："
+  echo "  编辑配置：nano $SITE_FILE"
+  echo "  检查配置：nginx -t"
+  echo "  重载 Nginx：systemctl reload nginx"
+  echo
+  warn "如果访问仍是 Nginx 欢迎页，优先检查 DNS、server_name、default 默认站点。"
 }
 
 install_certbot_and_issue() {
@@ -417,26 +468,24 @@ install_certbot_and_issue() {
   certbot --nginx -d "$CERT_DOMAIN"
 
   log "证书申请流程执行完成"
-  warn "建议执行：certbot renew --dry-run  测试自动续期"
+  echo
+  echo "建议执行续期测试："
+  echo "  certbot renew --dry-run"
 }
 
 show_status() {
   echo
   echo "============================================================"
-  echo "系统状态"
+  echo "当前状态"
   echo "============================================================"
   echo "系统：$OS_PRETTY"
   echo
 
   if command -v docker >/dev/null 2>&1; then
     docker --version || true
-    if docker compose version >/dev/null 2>&1; then
-      docker compose version || true
-    else
-      warn "Docker Compose 插件不可用"
-    fi
+    docker compose version || warn "Docker Compose 插件不可用"
     echo
-    echo "当前容器："
+    echo "Docker 容器："
     docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" || true
   else
     warn "Docker 未安装"
@@ -447,13 +496,18 @@ show_status() {
     nginx -v || true
     nginx -t || true
     echo
-    echo "已启用 Nginx 站点："
+    echo "Nginx 已启用站点："
     ls -l /etc/nginx/sites-enabled/ 2>/dev/null || true
   else
     warn "Nginx 未安装"
   fi
 
   echo
+  if command -v certbot >/dev/null 2>&1; then
+    certbot --version || true
+  else
+    warn "Certbot 未安装"
+  fi
 }
 
 show_commands() {
@@ -475,6 +529,7 @@ Docker Compose：
   docker compose up -d
   docker compose pull
   docker compose down
+  docker compose logs -f
 
 Nginx：
   nginx -t
@@ -506,8 +561,8 @@ menu() {
     echo " 1) 安装基础环境（Docker + Compose 插件 + Nginx）"
     echo " 2) 只安装 / 检测 Docker + Compose 插件"
     echo " 3) 只安装 / 检测 Nginx"
-    echo " 4) 创建 Docker 服务模板"
-    echo " 5) 创建 Nginx 反向代理配置"
+    echo " 4) 创建 Docker 服务目录和 docker-compose.yml 模板"
+    echo " 5) 创建 Nginx 通用反向代理配置"
     echo " 6) 安装 Certbot 并申请 HTTPS 证书"
     echo " 7) 查看当前状态"
     echo " 8) 查看常用命令速查"
