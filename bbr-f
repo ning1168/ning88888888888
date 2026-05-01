@@ -1,44 +1,70 @@
 #!/bin/bash
 
-# Debian 12 BBR 一键开启 + 状态检测脚本
-# 适用于 VPS / 云服务器
+# Debian 12 BBR 一键开启 / 状态检测脚本
 
-echo "=============================="
-echo " Debian 12 BBR 检测与开启脚本"
-echo "=============================="
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+NC="\033[0m"
 
-# 必须使用 root 权限
+check_bbr() {
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+
+    if [ "$current_cc" = "bbr" ] && [ "$current_qdisc" = "fq" ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+show_status() {
+    echo
+    echo "当前状态："
+    echo "内核版本：$(uname -r)"
+    echo "拥塞算法：$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+    echo "队列算法：$(sysctl -n net.core.default_qdisc 2>/dev/null)"
+}
+
+echo "================================"
+echo " Debian 12 BBR 检测 / 开启脚本"
+echo "================================"
+
 if [ "$EUID" -ne 0 ]; then
-    echo "请使用 root 权限运行："
-    echo "sudo bash bbr.sh"
+    echo -e "${RED}请使用 root 权限运行：sudo bash bbr-f${NC}"
     exit 1
 fi
 
-echo
-echo "当前内核版本："
-uname -r
+show_status
+
+if check_bbr; then
+    echo
+    echo -e "${GREEN}BBR 已配置成功，无需重复开启。${NC}"
+
+    if ss -ti | grep -q "bbr"; then
+        echo -e "${GREEN}检测到当前已有连接正在使用 BBR。${NC}"
+    else
+        echo -e "${YELLOW}暂未检测到当前连接使用 BBR。${NC}"
+        echo "说明：BBR 只对新建立的 TCP 连接生效。"
+        echo "建议：重新连接 SSH 后，再次运行本脚本检测。"
+    fi
+
+    exit 0
+fi
 
 echo
-echo "当前拥塞控制算法："
-sysctl net.ipv4.tcp_congestion_control
+echo -e "${YELLOW}BBR 尚未完整启用，开始配置...${NC}"
 
-echo
-echo "检测 BBR 模块..."
-
-# 尝试加载 BBR 模块
+echo "加载 BBR 模块..."
 modprobe tcp_bbr 2>/dev/null
 
-if lsmod | grep -q "tcp_bbr"; then
-    echo "BBR 模块已加载"
-else
-    echo "BBR 模块加载失败，当前系统可能不支持 BBR"
+if ! lsmod | grep -q "tcp_bbr"; then
+    echo -e "${RED}BBR 模块加载失败，系统可能不支持 BBR。${NC}"
     exit 1
 fi
 
-echo
-echo "写入 BBR 配置..."
+echo "写入系统配置..."
 
-# 删除旧的重复配置，避免多次运行重复写入
 sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
 sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
 
@@ -49,41 +75,20 @@ net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
 
-# 设置开机自动加载 tcp_bbr
 grep -q "^tcp_bbr$" /etc/modules || echo "tcp_bbr" >> /etc/modules
 
-echo
-echo "应用系统配置..."
-sysctl -p
+echo "应用配置..."
+sysctl -p >/dev/null
 
 echo
-echo "最终检测结果："
+show_status
 
-current_cc=$(sysctl -n net.ipv4.tcp_congestion_control)
-current_qdisc=$(sysctl -n net.core.default_qdisc)
-
-if [ "$current_cc" = "bbr" ] && [ "$current_qdisc" = "fq" ]; then
-    echo "BBR 配置成功"
+if check_bbr; then
+    echo
+    echo -e "${GREEN}BBR 开启成功。${NC}"
+    echo "提示：请重新连接 SSH，让新连接使用 BBR。"
 else
-    echo "BBR 配置未完全成功"
-    echo "当前拥塞控制算法：$current_cc"
-    echo "当前队列算法：$current_qdisc"
+    echo
+    echo -e "${RED}BBR 开启失败，请检查系统内核或权限。${NC}"
     exit 1
 fi
-
-echo
-echo "检测当前连接是否已使用 BBR："
-
-if ss -ti | grep -q "bbr"; then
-    echo "当前已有连接正在使用 BBR"
-else
-    echo "暂未检测到正在使用 BBR 的连接"
-    echo "说明：BBR 只对新建立的 TCP 连接生效"
-    echo "建议：重新连接 SSH，或等待新连接建立后再运行本脚本检测"
-fi
-
-echo
-echo "=============================="
-echo "完成"
-echo "再次运行本脚本，可查看 BBR 是否生效"
-echo "=============================="
