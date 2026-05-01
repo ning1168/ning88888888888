@@ -1,7 +1,21 @@
 #!/usr/bin/env bash
 # ============================================================
-# Docker + Docker Compose Plugin + Nginx 小白交互安装脚本
-# 适合：Debian / Ubuntu
+# Docker + Docker Compose Plugin + Nginx 小白菜单工具箱
+# 适合系统：Debian / Ubuntu
+#
+# 主要功能：
+# 1. 安装 / 检测 Docker
+# 2. 安装 / 检测 Docker Compose 插件
+# 3. 安装 / 检测 Nginx
+# 4. 创建 Docker 服务模板
+# 5. 创建 Nginx 反向代理配置
+# 6. 安装 Certbot 并申请 HTTPS 证书
+# 7. 查看常用状态
+#
+# 注意：
+# - 本脚本已取消 UFW 防火墙操作
+# - 不会自动删除你的 Docker 数据目录
+# - 创建配置前会尽量避免重复覆盖
 # ============================================================
 
 set -e
@@ -10,6 +24,7 @@ RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 BLUE="\033[34m"
+CYAN="\033[36m"
 NC="\033[0m"
 
 log() { echo -e "${GREEN}[成功]${NC} $1"; }
@@ -17,9 +32,15 @@ info() { echo -e "${BLUE}[提示]${NC} $1"; }
 warn() { echo -e "${YELLOW}[注意]${NC} $1"; }
 err() { echo -e "${RED}[错误]${NC} $1"; }
 
+SCRIPT_VERSION="2026.05.01-menu"
+
+OS_ID=""
+OS_CODENAME=""
+OS_PRETTY=""
+
 need_root() {
   if [ "$(id -u)" -ne 0 ]; then
-    err "请使用 root 用户运行，或使用 sudo bash install.sh"
+    err "请使用 root 用户运行，例如：sudo bash install.sh"
     exit 1
   fi
 }
@@ -33,6 +54,7 @@ detect_os() {
   . /etc/os-release
   OS_ID="${ID:-unknown}"
   OS_CODENAME="${VERSION_CODENAME:-}"
+  OS_PRETTY="${PRETTY_NAME:-unknown}"
 
   if [ "$OS_ID" != "debian" ] && [ "$OS_ID" != "ubuntu" ]; then
     err "此脚本主要适配 Debian / Ubuntu，你当前系统是：$OS_ID"
@@ -43,8 +65,11 @@ detect_os() {
     err "无法识别系统版本代号 VERSION_CODENAME"
     exit 1
   fi
+}
 
-  log "检测到系统：$PRETTY_NAME"
+press_enter() {
+  echo
+  read -rp "按回车返回菜单..."
 }
 
 ask_yes_no() {
@@ -71,41 +96,59 @@ ask_yes_no() {
 
 safe_name() {
   local value="$1"
-  if ! echo "$value" | grep -Eq '^[a-zA-Z0-9._-]+$'; then
+  echo "$value" | grep -Eq '^[a-zA-Z0-9._-]+$'
+}
+
+valid_port() {
+  local value="$1"
+  if ! echo "$value" | grep -Eq '^[0-9]+$'; then
+    return 1
+  fi
+  if [ "$value" -lt 1 ] || [ "$value" -gt 65535 ]; then
     return 1
   fi
   return 0
 }
 
+backup_file_if_exists() {
+  local file="$1"
+  if [ -f "$file" ]; then
+    local bak="${file}.bak.$(date +%Y%m%d-%H%M%S)"
+    cp "$file" "$bak"
+    warn "检测到原文件已存在，已备份为：$bak"
+  fi
+}
+
 install_base_tools() {
-  info "更新 apt 软件源并安装基础工具..."
+  info "安装基础工具：curl wget ca-certificates gnupg lsb-release nano vim git..."
   apt update
-  apt install -y ca-certificates curl wget gnupg lsb-release nano vim git ufw
+  apt install -y ca-certificates curl wget gnupg lsb-release nano vim git
   log "基础工具安装完成"
 }
 
-install_docker_repo() {
+install_docker() {
+  detect_os
+  install_base_tools
+
   if command -v docker >/dev/null 2>&1; then
-    warn "检测到 Docker 已经安装，跳过 Docker 安装"
+    warn "检测到 Docker 已经安装，跳过 Docker 主程序安装"
     docker --version || true
-    return
-  fi
-
-  info "开始安装 Docker 官方 apt 仓库..."
-
-  apt remove -y docker.io docker-compose docker-doc podman-docker containerd runc 2>/dev/null || true
-
-  install -m 0755 -d /etc/apt/keyrings
-
-  if [ ! -f /etc/apt/keyrings/docker.asc ]; then
-    curl -fsSL "https://download.docker.com/linux/${OS_ID}/gpg" -o /etc/apt/keyrings/docker.asc
-    chmod a+r /etc/apt/keyrings/docker.asc
-    log "Docker GPG key 添加完成"
   else
-    warn "Docker GPG key 已存在，跳过"
-  fi
+    info "开始安装 Docker 官方 apt 仓库..."
 
-  cat > /etc/apt/sources.list.d/docker.sources <<EOF
+    apt remove -y docker.io docker-compose docker-doc podman-docker containerd runc 2>/dev/null || true
+
+    install -m 0755 -d /etc/apt/keyrings
+
+    if [ ! -f /etc/apt/keyrings/docker.asc ]; then
+      curl -fsSL "https://download.docker.com/linux/${OS_ID}/gpg" -o /etc/apt/keyrings/docker.asc
+      chmod a+r /etc/apt/keyrings/docker.asc
+      log "Docker GPG key 添加完成"
+    else
+      warn "Docker GPG key 已存在，跳过添加"
+    fi
+
+    cat > /etc/apt/sources.list.d/docker.sources <<EOF
 Types: deb
 URIs: https://download.docker.com/linux/${OS_ID}
 Suites: ${OS_CODENAME}
@@ -114,20 +157,22 @@ Architectures: $(dpkg --print-architecture)
 Signed-By: /etc/apt/keyrings/docker.asc
 EOF
 
-  apt update
-  apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    apt update
+    apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
-  systemctl enable docker
-  systemctl start docker
+    systemctl enable docker
+    systemctl start docker
 
-  log "Docker 安装完成"
-  docker --version
-  docker compose version
+    log "Docker 安装完成"
+    docker --version
+  fi
+
+  install_compose_plugin
 }
 
-install_compose_plugin_if_missing() {
+install_compose_plugin() {
   if docker compose version >/dev/null 2>&1; then
-    warn "检测到 Docker Compose 插件已经可用，跳过"
+    warn "检测到 Docker Compose 插件已经可用，跳过安装"
     docker compose version
   else
     info "安装 Docker Compose 插件..."
@@ -139,8 +184,10 @@ install_compose_plugin_if_missing() {
 }
 
 install_nginx() {
+  install_base_tools
+
   if command -v nginx >/dev/null 2>&1; then
-    warn "检测到 Nginx 已经安装，跳过 Nginx 安装"
+    warn "检测到 Nginx 已经安装，跳过安装"
     nginx -v || true
   else
     info "安装 Nginx..."
@@ -156,51 +203,28 @@ install_nginx() {
   log "Nginx 已启动并通过配置检查"
 }
 
-show_basic_commands() {
-  cat <<'EOF'
-
-============================================================
-常用命令速查
-============================================================
-
-查看正在运行的容器：
-  docker ps
-
-查看所有容器：
-  docker ps -a
-
-查看某个容器日志：
-  docker logs -f 容器名
-
-重启容器：
-  docker restart 容器名
-
-进入容器：
-  docker exec -it 容器名 sh
-
-进入项目目录后启动/更新：
-  docker compose up -d
-
-拉取最新镜像：
-  docker compose pull
-
-检查 Nginx 配置：
-  nginx -t
-
-重载 Nginx：
-  systemctl reload nginx
-
-============================================================
-
-EOF
+install_all_base() {
+  install_docker
+  install_nginx
+  info "基础环境安装完成：Docker + Compose 插件 + Nginx"
 }
 
 create_docker_template() {
-  if ! ask_yes_no "是否创建一个 Docker 服务模板目录？例如 s-ui / komari / oci-helper" "y"; then
-    return
+  if ! command -v docker >/dev/null 2>&1; then
+    warn "未检测到 Docker。建议先执行菜单 1 安装基础环境。"
+    if ! ask_yes_no "是否仍然继续创建模板？" "n"; then
+      return
+    fi
   fi
 
-  read -rp "请输入服务名称（英文，例：s-ui、komari、oci-helper，可自定义）: " SERVICE_NAME
+  echo
+  info "创建 Docker 服务模板"
+  echo "说明："
+  echo "  服务名称可以自定义，例如：s-ui、komari、oci-helper、myapp"
+  echo "  服务名称建议使用英文、数字、横杠，不要用中文或空格"
+  echo
+
+  read -rp "请输入服务名称: " SERVICE_NAME
   while ! safe_name "$SERVICE_NAME"; do
     err "服务名称只能包含英文、数字、点、横杠、下划线，不能有中文或空格"
     read -rp "请重新输入服务名称: " SERVICE_NAME
@@ -210,37 +234,86 @@ create_docker_template() {
   BASE_DIR="${BASE_DIR:-/opt/docker-apps}"
 
   APP_DIR="${BASE_DIR}/${SERVICE_NAME}"
+  COMPOSE_FILE="${APP_DIR}/docker-compose.yml"
+
+  if [ -f "$COMPOSE_FILE" ]; then
+    warn "已存在：$COMPOSE_FILE"
+    if ! ask_yes_no "是否覆盖？覆盖前会自动备份" "n"; then
+      warn "已取消创建 Docker 模板"
+      return
+    fi
+    backup_file_if_exists "$COMPOSE_FILE"
+  fi
+
+  echo
+  read -rp "请输入镜像名（例：nginx:latest，可先留空后面改）: " IMAGE_NAME
+  IMAGE_NAME="${IMAGE_NAME:-请改成你的镜像名:latest}"
+
+  read -rp "请输入容器内部端口（例：8080，不知道就填项目文档里的端口）: " CONTAINER_PORT
+  while ! valid_port "$CONTAINER_PORT"; do
+    err "端口必须是 1-65535 的数字"
+    read -rp "请重新输入容器内部端口: " CONTAINER_PORT
+  done
+
+  read -rp "请输入服务器本机端口（默认同容器端口 ${CONTAINER_PORT}）: " HOST_PORT
+  HOST_PORT="${HOST_PORT:-$CONTAINER_PORT}"
+  while ! valid_port "$HOST_PORT"; do
+    err "端口必须是 1-65535 的数字"
+    read -rp "请重新输入服务器本机端口: " HOST_PORT
+  done
+
+  if ask_yes_no "这个端口是否只允许本机访问？面板类服务建议选 Y" "y"; then
+    PORT_LINE="127.0.0.1:${HOST_PORT}:${CONTAINER_PORT}"
+  else
+    PORT_LINE="${HOST_PORT}:${CONTAINER_PORT}"
+  fi
 
   mkdir -p "$APP_DIR"
-  log "已创建目录：$APP_DIR"
 
-  cat > "$APP_DIR/docker-compose.yml" <<EOF
+  cat > "$COMPOSE_FILE" <<EOF
 services:
   ${SERVICE_NAME}:
-    image: 请改成你的镜像名:latest
+    image: ${IMAGE_NAME}
     container_name: ${SERVICE_NAME}
     restart: unless-stopped
     ports:
       # 格式说明：
-      # "127.0.0.1:宿主机端口:容器端口" = 只允许本机访问，推荐给面板类服务
-      # "宿主机端口:容器端口" = 暴露公网，谨慎使用
-      - "127.0.0.1:8080:8080"
+      # "127.0.0.1:宿主机端口:容器端口" = 只允许服务器本机访问，推荐给面板类服务
+      # "宿主机端口:容器端口" = 暴露公网，适合节点端口或必须公网访问的端口
+      - "${PORT_LINE}"
     volumes:
-      # 左边是服务器目录，右边是容器内部目录
-      # 这里是示例，具体路径要看项目官方文档
+      # 左边 ./data 是服务器目录，右边 /app/data 是容器内部目录
+      # 具体容器内部目录要看项目官方文档
       - ./data:/app/data
 EOF
 
-  log "已生成 Docker Compose 模板：$APP_DIR/docker-compose.yml"
-  warn "请先编辑 image、ports、volumes，再执行：cd $APP_DIR && docker compose up -d"
+  log "已生成 Docker Compose 模板：$COMPOSE_FILE"
+  echo
+  warn "下一步你通常需要编辑这个文件，把 image、ports、volumes 改成项目官方要求。"
+  echo "编辑命令："
+  echo "  nano $COMPOSE_FILE"
+  echo
+  echo "启动命令："
+  echo "  cd $APP_DIR && docker compose up -d"
 }
 
 create_nginx_proxy() {
-  if ! ask_yes_no "是否创建一个 Nginx 反向代理配置？" "y"; then
-    return
+  if ! command -v nginx >/dev/null 2>&1; then
+    warn "未检测到 Nginx。建议先执行菜单 1 安装基础环境。"
+    if ! ask_yes_no "是否仍然继续创建 Nginx 配置？" "n"; then
+      return
+    fi
   fi
 
-  read -rp "请输入 Nginx 配置名称（英文，例：s-ui、komari、oci-helper，可自定义）: " SITE_NAME
+  echo
+  info "创建 Nginx 反向代理配置"
+  echo "说明："
+  echo "  配置名称只是文件名，可以自定义，例如：s-ui、komari、oci-helper"
+  echo "  域名必须已经解析到这台服务器"
+  echo "  反代端口一般是 Docker 中 127.0.0.1:端口:容器端口 的那个宿主机端口"
+  echo
+
+  read -rp "请输入 Nginx 配置名称: " SITE_NAME
   while ! safe_name "$SITE_NAME"; do
     err "配置名称只能包含英文、数字、点、横杠、下划线，不能有中文或空格"
     read -rp "请重新输入配置名称: " SITE_NAME
@@ -249,16 +322,25 @@ create_nginx_proxy() {
   read -rp "请输入域名（例：app.example.com）: " DOMAIN
   while [ -z "$DOMAIN" ]; do
     err "域名不能为空"
-    read -rp "请输入域名（例：app.example.com）: " DOMAIN
+    read -rp "请输入域名: " DOMAIN
   done
 
   read -rp "请输入要反代到的本机端口（例：2095、25774、8818）: " TARGET_PORT
-  while ! echo "$TARGET_PORT" | grep -Eq '^[0-9]+$'; do
-    err "端口只能是数字"
+  while ! valid_port "$TARGET_PORT"; do
+    err "端口必须是 1-65535 的数字"
     read -rp "请重新输入端口: " TARGET_PORT
   done
 
   SITE_FILE="/etc/nginx/sites-available/${SITE_NAME}"
+
+  if [ -f "$SITE_FILE" ]; then
+    warn "Nginx 配置已存在：$SITE_FILE"
+    if ! ask_yes_no "是否覆盖？覆盖前会自动备份" "n"; then
+      warn "已取消创建 Nginx 配置"
+      return
+    fi
+    backup_file_if_exists "$SITE_FILE"
+  fi
 
   cat > "$SITE_FILE" <<EOF
 server {
@@ -278,14 +360,21 @@ server {
         # WebSocket 支持，很多面板、监控、VNC、终端服务都需要
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
+
+        send_timeout 10800;
+        proxy_read_timeout 10800;
+        proxy_send_timeout 10800;
     }
 }
 EOF
 
   ln -sf "$SITE_FILE" "/etc/nginx/sites-enabled/${SITE_NAME}"
 
-  if ask_yes_no "是否删除 Nginx 默认欢迎页配置？新服务器建议删除" "y"; then
-    rm -f /etc/nginx/sites-enabled/default
+  if [ -e /etc/nginx/sites-enabled/default ]; then
+    if ask_yes_no "检测到默认欢迎页配置 default，是否删除？新服务器建议删除" "y"; then
+      rm -f /etc/nginx/sites-enabled/default
+      log "已删除 /etc/nginx/sites-enabled/default"
+    fi
   fi
 
   nginx -t
@@ -295,15 +384,31 @@ EOF
   warn "如果访问仍是 Nginx 欢迎页，检查 DNS 是否解析到本机 IP，以及 server_name 是否写对"
 }
 
-install_certbot() {
-  if ! ask_yes_no "是否安装 Certbot 并申请 HTTPS 证书？" "n"; then
+install_certbot_and_issue() {
+  if ! command -v nginx >/dev/null 2>&1; then
+    err "未检测到 Nginx。请先安装 Nginx 并创建反向代理配置。"
     return
   fi
 
-  apt update
-  apt install -y certbot python3-certbot-nginx
+  if ! command -v certbot >/dev/null 2>&1; then
+    info "安装 Certbot..."
+    apt update
+    apt install -y certbot python3-certbot-nginx
+    log "Certbot 安装完成"
+  else
+    warn "检测到 Certbot 已经安装，跳过安装"
+    certbot --version || true
+  fi
 
-  read -rp "请输入要申请证书的域名（必须已解析到本服务器）: " CERT_DOMAIN
+  echo
+  info "申请 HTTPS 证书"
+  echo "注意："
+  echo "  1. 域名必须解析到当前服务器"
+  echo "  2. 80 端口必须能从公网访问"
+  echo "  3. Nginx 配置里必须有对应 server_name"
+  echo
+
+  read -rp "请输入要申请证书的域名（例：app.example.com）: " CERT_DOMAIN
   while [ -z "$CERT_DOMAIN" ]; do
     err "域名不能为空"
     read -rp "请输入要申请证书的域名: " CERT_DOMAIN
@@ -312,54 +417,123 @@ install_certbot() {
   certbot --nginx -d "$CERT_DOMAIN"
 
   log "证书申请流程执行完成"
-  warn "可以执行 certbot renew --dry-run 测试自动续期"
+  warn "建议执行：certbot renew --dry-run  测试自动续期"
 }
 
-open_firewall_basic() {
-  if ! command -v ufw >/dev/null 2>&1; then
-    warn "未检测到 ufw，跳过防火墙配置"
-    return
-  fi
+show_status() {
+  echo
+  echo "============================================================"
+  echo "系统状态"
+  echo "============================================================"
+  echo "系统：$OS_PRETTY"
+  echo
 
-  if ask_yes_no "是否用 UFW 放行 80 和 443？" "y"; then
-    ufw allow 80/tcp
-    ufw allow 443/tcp
-    log "已放行 80/443"
-  fi
-
-  if ask_yes_no "是否现在启用 UFW？注意：如果你是 SSH 连接，请确保 SSH 端口已放行" "n"; then
-    read -rp "请输入 SSH 端口（默认 22）: " SSH_PORT
-    SSH_PORT="${SSH_PORT:-22}"
-    ufw allow "${SSH_PORT}/tcp"
-    ufw --force enable
-    ufw status verbose
+  if command -v docker >/dev/null 2>&1; then
+    docker --version || true
+    if docker compose version >/dev/null 2>&1; then
+      docker compose version || true
+    else
+      warn "Docker Compose 插件不可用"
+    fi
+    echo
+    echo "当前容器："
+    docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" || true
   else
-    warn "未启用 UFW。如已启用，可手动执行 ufw status 查看规则"
+    warn "Docker 未安装"
   fi
+
+  echo
+  if command -v nginx >/dev/null 2>&1; then
+    nginx -v || true
+    nginx -t || true
+    echo
+    echo "已启用 Nginx 站点："
+    ls -l /etc/nginx/sites-enabled/ 2>/dev/null || true
+  else
+    warn "Nginx 未安装"
+  fi
+
+  echo
+}
+
+show_commands() {
+  cat <<'EOF'
+
+============================================================
+常用命令速查
+============================================================
+
+Docker：
+  docker ps
+  docker ps -a
+  docker logs -f 容器名
+  docker restart 容器名
+  docker exec -it 容器名 sh
+
+Docker Compose：
+  cd 项目目录
+  docker compose up -d
+  docker compose pull
+  docker compose down
+
+Nginx：
+  nginx -t
+  systemctl reload nginx
+  systemctl restart nginx
+  systemctl status nginx
+
+证书：
+  certbot --nginx -d 你的域名
+  certbot renew --dry-run
+
+端口检查：
+  ss -tulpen | grep 端口
+
+============================================================
+
+EOF
+}
+
+menu() {
+  while true; do
+    clear
+    echo "============================================================"
+    echo " Docker + Nginx 小白菜单工具箱"
+    echo " 版本：${SCRIPT_VERSION}"
+    echo " 系统：${OS_PRETTY}"
+    echo "============================================================"
+    echo
+    echo " 1) 安装基础环境（Docker + Compose 插件 + Nginx）"
+    echo " 2) 只安装 / 检测 Docker + Compose 插件"
+    echo " 3) 只安装 / 检测 Nginx"
+    echo " 4) 创建 Docker 服务模板"
+    echo " 5) 创建 Nginx 反向代理配置"
+    echo " 6) 安装 Certbot 并申请 HTTPS 证书"
+    echo " 7) 查看当前状态"
+    echo " 8) 查看常用命令速查"
+    echo " 0) 退出"
+    echo
+    read -rp "请选择功能编号: " choice
+
+    case "$choice" in
+      1) install_all_base; press_enter ;;
+      2) install_docker; press_enter ;;
+      3) install_nginx; press_enter ;;
+      4) create_docker_template; press_enter ;;
+      5) create_nginx_proxy; press_enter ;;
+      6) install_certbot_and_issue; press_enter ;;
+      7) show_status; press_enter ;;
+      8) show_commands; press_enter ;;
+      0) echo "已退出"; exit 0 ;;
+      *) echo "无效选项"; sleep 1 ;;
+    esac
+  done
 }
 
 main() {
-  clear
-  echo "============================================================"
-  echo " Docker + Docker Compose Plugin + Nginx 交互安装脚本"
-  echo " 支持：Debian / Ubuntu"
-  echo "============================================================"
-  echo
-
   need_root
   detect_os
-
-  install_base_tools
-  install_docker_repo
-  install_compose_plugin_if_missing
-  install_nginx
-  open_firewall_basic
-  create_docker_template
-  create_nginx_proxy
-  install_certbot
-  show_basic_commands
-
-  log "全部流程执行完成"
+  menu
 }
 
 main "$@"
