@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VERSION="1.2.1"
+VERSION="1.3.0"
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
@@ -22,13 +22,12 @@ check_root(){
 show_header(){
     clear
     echo "=================================="
-    echo " BBR 管理脚本 v${VERSION}"
+    echo " BBR + Swap 管理脚本 v${VERSION}"
     echo "=================================="
 }
 
-clean(){
+clean_bbr(){
     sed -i '/# BBR Manager Start/,/# BBR Manager End/d' /etc/sysctl.conf
-
     sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
     sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
     sed -i '/net.core.rmem_max/d' /etc/sysctl.conf
@@ -40,7 +39,7 @@ clean(){
     sed -i '/net.ipv4.tcp_max_syn_backlog/d' /etc/sysctl.conf
 }
 
-detect_mode(){
+detect_bbr_mode(){
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
     rmem=$(sysctl -n net.core.rmem_max 2>/dev/null)
@@ -63,7 +62,7 @@ detect_mode(){
     fi
 }
 
-show_status(){
+show_bbr_status(){
     show_header
 
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
@@ -75,7 +74,7 @@ show_status(){
     echo "拥塞: ${cc:-未知}"
     echo "队列: ${qdisc:-未知}"
     echo "TFO : ${tfo:-未知}"
-    echo "模式: $(detect_mode)"
+    echo "模式: $(detect_bbr_mode)"
     echo
 
     if [ "$cc" = "bbr" ] && [ "$qdisc" = "fq" ]; then
@@ -86,7 +85,6 @@ show_status(){
 
     echo
     echo "连接检测: 仅供参考"
-
     if ss -ti 2>/dev/null | grep -q "bbr"; then
         success "检测到部分连接显示 BBR"
     else
@@ -113,7 +111,7 @@ check_bbr_support(){
     return 0
 }
 
-enable_default(){
+enable_bbr_default(){
     show_header
     info "开启 BBR 默认版"
 
@@ -122,7 +120,7 @@ enable_default(){
         return
     }
 
-    clean
+    clean_bbr
 
     cat >> /etc/sysctl.conf <<EOF
 
@@ -149,7 +147,7 @@ EOF
     pause
 }
 
-enable_opt(){
+enable_bbr_opt(){
     show_header
     info "开启 BBR 优化版"
 
@@ -158,7 +156,7 @@ enable_opt(){
         return
     }
 
-    clean
+    clean_bbr
 
     cat >> /etc/sysctl.conf <<EOF
 
@@ -188,11 +186,9 @@ EOF
 
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
-    tfo=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null)
 
     if [ "$cc" = "bbr" ] && [ "$qdisc" = "fq" ]; then
         success "BBR 优化版开启成功"
-        echo "TFO: $tfo"
     else
         error "BBR 优化版开启失败"
     fi
@@ -200,7 +196,7 @@ EOF
     pause
 }
 
-uninstall(){
+uninstall_bbr(){
     show_header
     warn "卸载 BBR，并恢复 cubic"
 
@@ -212,8 +208,7 @@ uninstall(){
         return
     fi
 
-    clean
-
+    clean_bbr
     sed -i '/^tcp_bbr$/d' /etc/modules
 
     cat >> /etc/sysctl.conf <<EOF
@@ -231,22 +226,186 @@ EOF
     pause
 }
 
-menu(){
+recommend_swap_size(){
+    mem_mb=$(free -m | awk '/Mem:/ {print $2}')
+
+    if [ "$mem_mb" -le 512 ]; then
+        echo "1G"
+    elif [ "$mem_mb" -le 1024 ]; then
+        echo "2G"
+    elif [ "$mem_mb" -le 2048 ]; then
+        echo "2G"
+    else
+        echo "1G"
+    fi
+}
+
+show_swap_status(){
+    show_header
+    echo
+    echo "内存 / Swap 状态:"
+    echo "----------------------------------"
+    free -h
+    echo
+    echo "Swap 文件:"
+    echo "----------------------------------"
+    swapon --show
+    echo
+
+    if swapon --show | grep -q "/swapfile"; then
+        success "Swap 已开启"
+    else
+        warn "未检测到 /swapfile"
+    fi
+}
+
+remove_swap_config(){
+    sed -i '/# Swap Manager Start/,/# Swap Manager End/d' /etc/sysctl.conf
+    sed -i '/vm.swappiness/d' /etc/sysctl.conf
+    sed -i '/vm.vfs_cache_pressure/d' /etc/sysctl.conf
+    sed -i '\|^/swapfile|d' /etc/fstab
+}
+
+create_swap(){
+    show_header
+
+    recommended=$(recommend_swap_size)
+
+    echo "创建 / 重建 Swap"
+    echo
+    echo "检测到当前内存:"
+    free -h | awk '/Mem:/ {print "内存: "$2}'
+    echo
+    echo "推荐 Swap 大小: $recommended"
+    echo
+
+    read -rp "请输入 Swap 大小 [默认 $recommended]: " swap_size
+    swap_size=${swap_size:-$recommended}
+
+    if ! echo "$swap_size" | grep -Eq '^[0-9]+[GgMm]$'; then
+        error "格式错误，请输入 1G / 2G / 512M 这种格式"
+        pause
+        return
+    fi
+
+    if [ -f /swapfile ] || swapon --show | grep -q "/swapfile"; then
+        warn "检测到已有 /swapfile，将先删除"
+        swapoff /swapfile 2>/dev/null
+        rm -f /swapfile
+    fi
+
+    remove_swap_config
+
+    info "正在创建 ${swap_size} Swap 文件"
+
+    if command -v fallocate >/dev/null 2>&1; then
+        fallocate -l "$swap_size" /swapfile 2>/dev/null
+    fi
+
+    if [ ! -s /swapfile ]; then
+        size_num=$(echo "$swap_size" | sed 's/[GgMm]//g')
+        size_unit=$(echo "$swap_size" | sed 's/[0-9]//g' | tr 'a-z' 'A-Z')
+
+        if [ "$size_unit" = "G" ]; then
+            count=$((size_num * 1024))
+        else
+            count=$size_num
+        fi
+
+        dd if=/dev/zero of=/swapfile bs=1M count="$count" status=progress
+    fi
+
+    chmod 600 /swapfile
+    mkswap /swapfile >/dev/null 2>&1
+    swapon /swapfile
+
+    if ! swapon --show | grep -q "/swapfile"; then
+        error "Swap 开启失败"
+        pause
+        return
+    fi
+
+    echo "/swapfile none swap sw 0 0" >> /etc/fstab
+
+    cat >> /etc/sysctl.conf <<EOF
+
+# Swap Manager Start
+vm.swappiness=10
+vm.vfs_cache_pressure=50
+# Swap Manager End
+EOF
+
+    sysctl -p >/dev/null 2>&1
+
+    success "Swap 创建成功: $swap_size"
+    echo
+    free -h
+
+    pause
+}
+
+delete_swap(){
+    show_header
+    warn "关闭并删除 /swapfile"
+
+    read -rp "确认删除？输入 y 继续: " confirm
+
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+        warn "已取消"
+        pause
+        return
+    fi
+
+    swapoff /swapfile 2>/dev/null
+    rm -f /swapfile
+    remove_swap_config
+
+    sysctl -p >/dev/null 2>&1
+
+    success "Swap 已关闭并删除"
+    pause
+}
+
+swap_menu(){
+    while true; do
+        show_header
+        echo "Swap 管理"
+        echo
+        echo "1. 创建 / 重建 Swap"
+        echo "2. 查看 Swap 状态"
+        echo "3. 删除 Swap"
+        echo "0. 返回主菜单"
+        echo
+        read -rp "选择: " s
+
+        case "$s" in
+            1) create_swap ;;
+            2) show_swap_status; pause ;;
+            3) delete_swap ;;
+            0) return ;;
+            *) warn "无效输入"; sleep 1 ;;
+        esac
+    done
+}
+
+main_menu(){
     while true; do
         show_header
         echo "1. 开启 BBR 默认版"
         echo "2. 开启 BBR 优化版"
-        echo "3. 查看状态"
-        echo "4. 卸载 BBR"
+        echo "3. Swap 虚拟内存管理"
+        echo "4. 查看 BBR 状态"
+        echo "5. 卸载 BBR"
         echo "0. 退出"
         echo
         read -rp "选择: " c
 
         case "$c" in
-            1) enable_default ;;
-            2) enable_opt ;;
-            3) show_status; pause ;;
-            4) uninstall ;;
+            1) enable_bbr_default ;;
+            2) enable_bbr_opt ;;
+            3) swap_menu ;;
+            4) show_bbr_status; pause ;;
+            5) uninstall_bbr ;;
             0) exit 0 ;;
             *) warn "无效输入"; sleep 1 ;;
         esac
@@ -254,4 +413,4 @@ menu(){
 }
 
 check_root
-menu
+main_menu
