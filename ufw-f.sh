@@ -59,8 +59,11 @@ bad() {
 
 confirm_yes() {
     warn "$1"
-    read -rp "确认继续？输入 YES：" yes
-    [ "$yes" = "YES" ]
+    read -rp "确认继续？输入 yes/y：" yes
+    case "$yes" in
+        y|Y|yes|YES|Yes) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 pkg_install() {
@@ -257,7 +260,7 @@ recommended_install() {
     read -rp "是否启用UFW？默认Y：[Y/n] " yn
     yn="${yn:-Y}"
     case "$yn" in
-        y|Y) ufw --force enable ;;
+        y|Y|yes|YES|Yes) ufw --force enable ;;
         *) warn "已跳过启用UFW" ;;
     esac
 
@@ -328,7 +331,6 @@ show_open_ports_simple() {
 
     rm -f "$tmp"
 }
-
 show_ufw_raw_rules() {
     title "详细规则"
     echo "ALLOW IN=放行，DENY IN=拒绝，(v6)=IPv6"
@@ -346,8 +348,11 @@ ufw_allow_ports() {
         clean="$(echo "$p" | sed 's#/.*##')"
         if is_danger_port "$clean"; then
             warn "$clean 是高风险端口：$(port_name "$clean")"
-            read -rp "确认放行 $p？输入YES：" yes
-            [ "$yes" != "YES" ] && { warn "跳过 $p"; continue; }
+            read -rp "确认放行 $p？输入 yes/y：" yes
+            case "$yes" in
+                y|Y|yes|YES|Yes) ;;
+                *) warn "跳过 $p"; continue ;;
+            esac
         fi
         ufw allow "$p" comment "用户允许规则"
         ok "已放行 $p"
@@ -390,45 +395,53 @@ ufw_delete_by_port() {
 
                 case "$mode" in
                     1)
-                        deleted=0
-                        ufw delete allow "$p" >/dev/null 2>&1 && deleted=1
-                        ufw delete allow "$p/tcp" >/dev/null 2>&1 && deleted=1 || true
-                        ufw delete allow "$p/udp" >/dev/null 2>&1 && deleted=1 || true
-
-                        # 有些规则无法被高层命令一次删掉，补充用编号倒序删
                         mapfile -t nums < <(ufw status numbered | awk -v p="$clean" '
-                            $0 ~ "^\\[" && $0 ~ ("[[:space:]]" p "(/tcp|/udp)?( \\(v6\\))?[[:space:]]") && $0 ~ "ALLOW" {
-                                gsub("\\[","",$1); gsub("\\]","",$1); print $1
+                            $0 ~ "^\\[" && $0 ~ "ALLOW" {
+                                line=$0
+                                gsub("\\(v6\\)","",line)
+                                if (line ~ ("(^|[[:space:]])" p "($|/tcp|/udp|[[:space:]])")) {
+                                    n=$1
+                                    gsub("\\[","",n); gsub("\\]","",n)
+                                    print n
+                                }
                             }' | sort -nr)
-                        for n in "${nums[@]}"; do ufw --force delete "$n" >/dev/null 2>&1 && deleted=1; done
-
-                        [ "$deleted" = 1 ] && ok "已删除 $p" || warn "未找到 $p"
+                        label="$p"
                         ;;
                     2)
                         mapfile -t nums < <(ufw status numbered | awk -v p="$clean" '
-                            $0 ~ "^\\[" && $0 !~ "\\(v6\\)" && $0 ~ ("[[:space:]]" p "(/tcp|/udp)?[[:space:]]") && $0 ~ "ALLOW" {
-                                gsub("\\[","",$1); gsub("\\]","",$1); print $1
+                            $0 ~ "^\\[" && $0 ~ "ALLOW" && $0 !~ "\\(v6\\)" {
+                                line=$0
+                                if (line ~ ("(^|[[:space:]])" p "($|/tcp|/udp|[[:space:]])")) {
+                                    n=$1
+                                    gsub("\\[","",n); gsub("\\]","",n)
+                                    print n
+                                }
                             }' | sort -nr)
-                        if [ "${#nums[@]}" -eq 0 ]; then
-                            warn "未找到 $p 的v4规则"
-                        else
-                            for n in "${nums[@]}"; do ufw --force delete "$n"; done
-                            ok "已删除 $p 的v4规则"
-                        fi
+                        label="$p 的v4规则"
                         ;;
                     3)
                         mapfile -t nums < <(ufw status numbered | awk -v p="$clean" '
-                            $0 ~ "^\\[" && $0 ~ "\\(v6\\)" && $0 ~ ("[[:space:]]" p "(/tcp|/udp)?[[:space:]]") && $0 ~ "ALLOW" {
-                                gsub("\\[","",$1); gsub("\\]","",$1); print $1
+                            $0 ~ "^\\[" && $0 ~ "ALLOW" && $0 ~ "\\(v6\\)" {
+                                line=$0
+                                gsub("\\(v6\\)","",line)
+                                if (line ~ ("(^|[[:space:]])" p "($|/tcp|/udp|[[:space:]])")) {
+                                    n=$1
+                                    gsub("\\[","",n); gsub("\\]","",n)
+                                    print n
+                                }
                             }' | sort -nr)
-                        if [ "${#nums[@]}" -eq 0 ]; then
-                            warn "未找到 $p 的v6规则"
-                        else
-                            for n in "${nums[@]}"; do ufw --force delete "$n"; done
-                            ok "已删除 $p 的v6规则"
-                        fi
+                        label="$p 的v6规则"
                         ;;
                 esac
+
+                if [ "${#nums[@]}" -eq 0 ]; then
+                    warn "未找到 ${label}"
+                else
+                    for n in "${nums[@]}"; do
+                        ufw --force delete "$n" >/dev/null 2>&1
+                    done
+                    ok "已删除 ${label}"
+                fi
             done
             ;;
         4)
@@ -445,7 +458,6 @@ ufw_delete_by_port() {
             ;;
     esac
 }
-
 ufw_action_menu() {
     title "防火墙操作"
     echo "1. 启用"
