@@ -203,6 +203,44 @@ service_hint() {
     esac
 }
 
+
+# 从 UFW 编号规则中查找端口对应的规则编号
+# 参数1：端口
+# 参数2：all / v4 / v6
+ufw_find_rule_nums() {
+    port="$1"
+    scope="$2"
+
+    ufw status numbered 2>/dev/null | while IFS= read -r line; do
+        case "$line" in
+            \[*)
+                num="$(echo "$line" | sed -n 's/^\[[[:space:]]*\([0-9][0-9]*\)\].*/\1/p')"
+                [ -z "$num" ] && continue
+
+                case "$scope" in
+                    v4) echo "$line" | grep -q "(v6)" && continue ;;
+                    v6) echo "$line" | grep -q "(v6)" || continue ;;
+                esac
+
+                # 去掉编号和(v6)，只检查 To 字段附近是否匹配端口
+                body="$(echo "$line" | sed 's/^\[[^]]*\][[:space:]]*//' | sed 's/(v6)//g')"
+                to_field="$(echo "$body" | awk '{print $1}')"
+                clean_to="$(echo "$to_field" | sed 's#/tcp##;s#/udp##')"
+
+                if [ "$clean_to" = "$port" ]; then
+                    echo "$num"
+                fi
+                ;;
+        esac
+    done | sort -nr
+}
+
+# 按编号静默删除，避免交互，且不用 ufw --force delete（部分版本会打印帮助）
+ufw_delete_num_quiet() {
+    num="$1"
+    printf 'y\n' | ufw delete "$num" >/dev/null 2>&1
+}
+
 # ==================================================
 # 状态 / 安装
 # ==================================================
@@ -292,7 +330,14 @@ show_open_ports_simple() {
     echo "$v" | grep -qi "Default: deny (incoming)" && ok "入站：默认拒绝" || warn "入站：不是默认拒绝"
 
     tmp="$(mktemp)"
-    ufw status 2>/dev/null | awk 'NR>4 && $0 !~ /^--/ && /ALLOW/ {print $1}' > "$tmp"
+
+    ufw status 2>/dev/null | awk '
+        NR>4 && $0 !~ /^--/ && /ALLOW/ {
+            to=$1
+            if ($2=="(v6)") to=to" (v6)"
+            print to
+        }
+    ' > "$tmp"
 
     echo
     if [ ! -s "$tmp" ]; then
@@ -394,51 +439,19 @@ ufw_delete_by_port() {
                 clean="$(echo "$p" | sed 's#/.*##')"
 
                 case "$mode" in
-                    1)
-                        mapfile -t nums < <(ufw status numbered | awk -v p="$clean" '
-                            $0 ~ "^\\[" && $0 ~ "ALLOW" {
-                                line=$0
-                                gsub("\\(v6\\)","",line)
-                                if (line ~ ("(^|[[:space:]])" p "($|/tcp|/udp|[[:space:]])")) {
-                                    n=$1
-                                    gsub("\\[","",n); gsub("\\]","",n)
-                                    print n
-                                }
-                            }' | sort -nr)
-                        label="$p"
-                        ;;
-                    2)
-                        mapfile -t nums < <(ufw status numbered | awk -v p="$clean" '
-                            $0 ~ "^\\[" && $0 ~ "ALLOW" && $0 !~ "\\(v6\\)" {
-                                line=$0
-                                if (line ~ ("(^|[[:space:]])" p "($|/tcp|/udp|[[:space:]])")) {
-                                    n=$1
-                                    gsub("\\[","",n); gsub("\\]","",n)
-                                    print n
-                                }
-                            }' | sort -nr)
-                        label="$p 的v4规则"
-                        ;;
-                    3)
-                        mapfile -t nums < <(ufw status numbered | awk -v p="$clean" '
-                            $0 ~ "^\\[" && $0 ~ "ALLOW" && $0 ~ "\\(v6\\)" {
-                                line=$0
-                                gsub("\\(v6\\)","",line)
-                                if (line ~ ("(^|[[:space:]])" p "($|/tcp|/udp|[[:space:]])")) {
-                                    n=$1
-                                    gsub("\\[","",n); gsub("\\]","",n)
-                                    print n
-                                }
-                            }' | sort -nr)
-                        label="$p 的v6规则"
-                        ;;
+                    1) scope="all"; label="$p" ;;
+                    2) scope="v4"; label="$p 的v4规则" ;;
+                    3) scope="v6"; label="$p 的v6规则" ;;
                 esac
+
+                mapfile -t nums < <(ufw_find_rule_nums "$clean" "$scope")
 
                 if [ "${#nums[@]}" -eq 0 ]; then
                     warn "未找到 ${label}"
                 else
+                    ok "将删除编号：${nums[*]}"
                     for n in "${nums[@]}"; do
-                        ufw --force delete "$n" >/dev/null 2>&1
+                        ufw_delete_num_quiet "$n"
                     done
                     ok "已删除 ${label}"
                 fi
@@ -450,7 +463,7 @@ ufw_delete_by_port() {
             read -rp "编号，多个用空格，会自动倒序：" nums
             [ -z "$nums" ] && warn "未输入编号" && return
             for n in $(echo "$nums" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -nr); do
-                ufw --force delete "$n"
+                ufw_delete_num_quiet "$n"
             done
             ;;
         *)
